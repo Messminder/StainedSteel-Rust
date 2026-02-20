@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
-
 use crate::canvas::Canvas;
 use crate::config::{DashboardConfig, Position, Widget};
 use crate::metrics::MetricsSample;

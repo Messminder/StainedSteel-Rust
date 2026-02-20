@@ -8,14 +8,20 @@ Works on an Apex 5 keyboard. Other keyboards untested.
 ## Screenshots
 
 ![Screenshot 1](Media/screenshot1.png)
+
 ![Screenshot 2](Media/screenshot2.png)
 
-## Scope
+## Dashboard Features
 
-- Loads a single JSON profile: `profiles/dashboard.json`
-- Renders a dashboard with: CPU, volume, keyboard lock states, memory graph, network speeds
-- Sends frames directly to Apex 5 hidraw interface (`VID 1038`, `PID 161C`, `mi_01`)
-- No plugin system, no web editor, no profile manager, respected the KISS principle as much as an AI could.
+- Key indicators for ScrlLock, NumLock and CruseCTRL.
+- Volume slider for scroll wheel with Earthbound numeral display.
+- Mute wheel button works.
+- RAM monitor.
+- CPU monitor.
+- Network monitor.
+- Animated elements and boot animation.
+- Per-widget refresh rate.
+- Easy install script, don't be afraid.
 
 ## Run
 
