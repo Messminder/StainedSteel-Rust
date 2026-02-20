@@ -7,7 +7,7 @@ Simple, purpose-built Rust driver for SteelSeries Apex 5 OLED on Linux.
 - Loads a single JSON profile: `profiles/dashboard.json`
 - Renders a dashboard with: CPU, volume, keyboard lock states, memory graph, network speeds
 - Sends frames directly to Apex 5 hidraw interface (`VID 1038`, `PID 161C`, `mi_01`)
-- No plugin system, no web editor, no profile manager
+- No plugin system, no web editor, no profile manager, respected the KISS principle as much as an AI could.
 
 ## Run
 
