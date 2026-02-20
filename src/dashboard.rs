@@ -95,12 +95,12 @@ impl DashboardRenderer {
             }
         }
 
-        self.draw_sine_wave_gap(config);
+        self.draw_sine_wave_gap(config, sample);
 
         self.canvas.to_packed_bytes()
     }
 
-    fn draw_sine_wave_gap(&mut self, config: &DashboardConfig) {
+    fn draw_sine_wave_gap(&mut self, config: &DashboardConfig, sample: &MetricsSample) {
         let volume = match config.widgets.iter().find(|w| w.enabled && w.kind == "volume") {
             Some(w) => w,
             None => return,
@@ -134,14 +134,34 @@ impl DashboardRenderer {
         }
 
         let center_y = (draw_top + draw_bottom) / 2;
-        let amplitude = ((draw_bottom - draw_top) / 2).max(1) as f32;
-        let wavelength = 18.0f32;
-        let phase = self.boot_started.elapsed().as_secs_f32() * 3.2;
+        if sample.volume_percent <= 0.0 || sample.audio_waveform.is_empty() {
+            self.canvas.line(clip_left, center_y, clip_right, center_y, true);
+            return;
+        }
+
+        let max_amp = ((draw_bottom - draw_top) / 2).max(1) as f32;
+        let level = (sample.audio_level / 100.0).clamp(0.0, 1.0);
+        let silence_gate = 0.02f32;
+
+        if level <= silence_gate {
+            self.canvas.line(clip_left, center_y, clip_right, center_y, true);
+            return;
+        }
+
+        // Draw real waveform samples
+        let width = (clip_right - clip_left + 1) as usize;
+        let waveform = &sample.audio_waveform;
+        let waveform_len = waveform.len();
 
         let mut prev_y: Option<i32> = None;
-        for x in clip_left..=clip_right {
-            let theta = ((x - clip_left) as f32 / wavelength) * TAU + phase;
-            let y = (center_y as f32 + amplitude * theta.sin())
+        let gain = 5.0f32; // Amplification factor
+        for (i, x) in (clip_left..=clip_right).enumerate() {
+            // Map display x to waveform sample index
+            let sample_idx = (i * waveform_len) / width.max(1);
+            let sample_val = waveform.get(sample_idx).copied().unwrap_or(0.0);
+
+            // Scale sample to display amplitude with gain
+            let y = (center_y as f32 - sample_val * gain * max_amp)
                 .round()
                 .clamp(draw_top as f32, draw_bottom as f32) as i32;
 

@@ -1,5 +1,8 @@
 use std::fs;
-use std::process::Command;
+use std::io::{ErrorKind, Read};
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
@@ -7,6 +10,7 @@ pub struct MetricIntervals {
     pub cpu_ms: u32,
     pub memory_ms: u32,
     pub volume_ms: u32,
+    pub audio_ms: u32,
     pub network_ms: u32,
     pub keyboard_ms: u32,
 }
@@ -17,6 +21,7 @@ impl Default for MetricIntervals {
             cpu_ms: 0,
             memory_ms: 0,
             volume_ms: 100,
+            audio_ms: 25,
             network_ms: 1000,
             keyboard_ms: 50,
         }
@@ -28,6 +33,8 @@ pub struct MetricsSample {
     pub cpu_percent: f32,
     pub mem_percent: f32,
     pub volume_percent: f32,
+    pub audio_level: f32,
+    pub audio_waveform: Vec<f32>,
     pub net_up_bps: f64,
     pub net_down_bps: f64,
     pub caps_lock: bool,
@@ -49,6 +56,11 @@ struct NetSnapshot {
     at: Option<Instant>,
 }
 
+struct AudioMonitorCapture {
+    sink_name: String,
+    child: Child,
+}
+
 pub struct MetricsCollector {
     intervals: MetricIntervals,
     last_cpu_percent: Option<(f32, Instant)>,
@@ -57,7 +69,20 @@ pub struct MetricsCollector {
     last_net: Option<NetSnapshot>,
     last_network_speed: Option<((f64, f64), Instant)>,
     last_volume: Option<(f32, Instant)>,
+    last_audio_level: Option<(f32, Instant)>,
+    audio_level_ema: f32,
+    audio_monitor: Option<AudioMonitorCapture>,
+    cached_default_sink: Option<String>,
+    cached_monitor_source: Option<String>,
+    last_audio_route_probe: Option<Instant>,
+    audio_fresh_buf: Vec<u8>,
+    audio_scratch_buf: [u8; 512],
     last_keyboard_leds: Option<((bool, bool, bool), Instant)>,
+    caps_led_path: Option<PathBuf>,
+    num_led_path: Option<PathBuf>,
+    scroll_led_path: Option<PathBuf>,
+    led_paths_resolved: bool,
+    last_audio_waveform: Vec<f32>,
 }
 
 impl MetricsCollector {
@@ -70,7 +95,20 @@ impl MetricsCollector {
             last_net: None,
             last_network_speed: None,
             last_volume: None,
+            last_audio_level: None,
+            audio_level_ema: 0.0,
+            audio_monitor: None,
+            cached_default_sink: None,
+            cached_monitor_source: None,
+            last_audio_route_probe: None,
+            audio_fresh_buf: Vec::with_capacity(1024),
+            audio_scratch_buf: [0u8; 512],
             last_keyboard_leds: None,
+            caps_led_path: None,
+            num_led_path: None,
+            scroll_led_path: None,
+            led_paths_resolved: false,
+            last_audio_waveform: Vec::with_capacity(128),
         }
     }
 
@@ -78,6 +116,7 @@ impl MetricsCollector {
         let cpu_percent = self.read_cpu_percent();
         let mem_percent = self.read_mem_percent();
         let volume_percent = self.read_volume_percent();
+        let audio_level = self.read_audio_output_level();
         let (net_down_bps, net_up_bps) = self.read_network_speed(preferred_iface);
         let (caps_lock, num_lock, scroll_lock) = self.read_keyboard_leds();
 
@@ -85,12 +124,39 @@ impl MetricsCollector {
             cpu_percent,
             mem_percent,
             volume_percent,
+            audio_level,
+            audio_waveform: self.last_audio_waveform.clone(),
             net_up_bps,
             net_down_bps,
             caps_lock,
             num_lock,
             scroll_lock,
         }
+    }
+
+    fn read_audio_output_level(&mut self) -> f32 {
+        let interval = Duration::from_millis(self.intervals.audio_ms as u64);
+        if let Some((cached, at)) = self.last_audio_level
+            && interval.as_millis() > 0
+            && at.elapsed() < interval
+        {
+            return cached;
+        }
+
+        let raw = self.read_output_monitor_level().unwrap_or(0.0);
+        let noise_floor = 1.4f32;
+        let trimmed = (raw - noise_floor).max(0.0);
+
+        self.audio_level_ema = self.audio_level_ema * 0.80 + trimmed * 0.20;
+        let filtered = if self.audio_level_ema < 0.7 {
+            0.0
+        } else {
+            self.audio_level_ema
+        }
+        .clamp(0.0, 100.0);
+
+        self.last_audio_level = Some((filtered, Instant::now()));
+        filtered
     }
 
     fn read_cpu_percent(&mut self) -> f32 {
@@ -188,8 +254,8 @@ impl MetricsCollector {
         }
 
         let volume = self
-            .read_volume_via_pactl()
-            .or_else(|| self.read_volume_via_wpctl())
+            .read_volume_via_wpctl()
+            .or_else(|| self.read_volume_via_pactl())
             .or_else(|| self.read_volume_via_amixer())
             .unwrap_or(0.0);
 
@@ -197,21 +263,7 @@ impl MetricsCollector {
         volume
     }
 
-    fn is_sink_muted_pactl(&self) -> bool {
-        let Ok(output) = Command::new("pactl")
-            .args(["get-sink-mute", "@DEFAULT_SINK@"])
-            .output()
-        else {
-            return false;
-        };
-        let text = String::from_utf8_lossy(&output.stdout);
-        text.contains("yes")
-    }
-
     fn read_volume_via_pactl(&self) -> Option<f32> {
-        if self.is_sink_muted_pactl() {
-            return Some(0.0);
-        }
         let output = Command::new("pactl")
             .args(["get-sink-volume", "@DEFAULT_SINK@"])
             .output()
@@ -255,6 +307,240 @@ impl MetricsCollector {
             return Some(0.0);
         }
         parse_percent_from_text(&text)
+    }
+
+    fn default_sink_name_pactl(&self) -> Option<String> {
+        let output = Command::new("pactl").arg("get-default-sink").output().ok()?;
+        if output.status.success() {
+            let sink = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !sink.is_empty() {
+                return Some(sink);
+            }
+        }
+
+        let output = Command::new("pactl").arg("info").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(rest) = line.trim().strip_prefix("Default Sink:") {
+                let sink = rest.trim().to_string();
+                if !sink.is_empty() {
+                    return Some(sink);
+                }
+            }
+        }
+        None
+    }
+
+    fn default_sink_monitor_source_pactl(&self) -> Option<String> {
+        let sink_name = self.default_sink_name_pactl()?;
+        let fallback = format!("{sink_name}.monitor");
+
+        let short_sources = Command::new("pactl")
+            .args(["list", "short", "sources"])
+            .output()
+            .ok();
+        let source_exists = |name: &str| -> bool {
+            short_sources
+                .as_ref()
+                .filter(|out| out.status.success())
+                .map(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .any(|line| line.split_whitespace().nth(1) == Some(name))
+                })
+                .unwrap_or(false)
+        };
+
+        let output = Command::new("pactl")
+            .args(["list", "sinks"])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            for block in String::from_utf8_lossy(&output.stdout).split("Sink #") {
+                let mut name: Option<String> = None;
+                let mut monitor_source: Option<String> = None;
+
+                for line in block.lines() {
+                    let trimmed = line.trim();
+                    if let Some(v) = trimmed.strip_prefix("Name:") {
+                        name = Some(v.trim().to_string());
+                    } else if let Some(v) = trimmed.strip_prefix("Monitor Source:") {
+                        monitor_source = Some(v.trim().to_string());
+                    }
+                }
+
+                if let (Some(n), Some(m)) = (name, monitor_source)
+                    && n == sink_name
+                    && m.ends_with(".monitor")
+                    && source_exists(&m)
+                {
+                    return Some(m);
+                }
+            }
+        }
+
+        if source_exists(&fallback) {
+            Some(fallback)
+        } else {
+            None
+        }
+    }
+
+    fn stop_audio_monitor(&mut self) {
+        if let Some(mut capture) = self.audio_monitor.take() {
+            let _ = capture.child.kill();
+            let _ = capture.child.wait();
+        }
+    }
+
+    fn refresh_audio_route_if_needed(&mut self, force: bool) {
+        let should_probe = force
+            || self.cached_default_sink.is_none()
+            || self.cached_monitor_source.is_none()
+            || self
+                .last_audio_route_probe
+                .is_none_or(|at| at.elapsed() >= Duration::from_millis(1500));
+
+        if !should_probe {
+            return;
+        }
+
+        self.last_audio_route_probe = Some(Instant::now());
+        if let Some(sink) = self.default_sink_name_pactl() {
+            self.cached_default_sink = Some(sink);
+        }
+        if let Some(mon) = self.default_sink_monitor_source_pactl() {
+            self.cached_monitor_source = Some(mon);
+        }
+    }
+
+    fn ensure_audio_monitor(&mut self) -> Option<()> {
+        self.refresh_audio_route_if_needed(false);
+        let sink_name = self.cached_default_sink.clone()?;
+
+        if let Some(existing) = &self.audio_monitor
+            && existing.sink_name == sink_name
+        {
+            return Some(());
+        }
+
+        self.stop_audio_monitor();
+        self.refresh_audio_route_if_needed(true);
+
+        let monitor_name = self.cached_monitor_source.clone()?;
+        let mut child = Command::new("parec")
+            .args([
+                "-d",
+                &monitor_name,
+                "--raw",
+                "--format=s16le",
+                "--rate=16000",
+                "--channels=1",
+                "--latency-msec=10",
+                "--process-time-msec=10",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+
+        if !Self::set_child_stdout_nonblocking(&mut child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        self.audio_monitor = Some(AudioMonitorCapture { sink_name, child });
+        Some(())
+    }
+
+    fn set_child_stdout_nonblocking(child: &mut Child) -> bool {
+        let Some(stdout) = child.stdout.as_ref() else {
+            return false;
+        };
+        let fd = stdout.as_raw_fd();
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 {
+                return false;
+            }
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+        }
+    }
+
+    fn read_output_monitor_level(&mut self) -> Option<f32> {
+        self.ensure_audio_monitor()?;
+
+        const SAMPLE_COUNT: usize = 192;
+        let target_bytes = SAMPLE_COUNT * 2;
+        self.audio_fresh_buf.clear();
+
+        let Some(capture) = self.audio_monitor.as_mut() else {
+            self.stop_audio_monitor();
+            return None;
+        };
+
+        if let Ok(Some(_)) = capture.child.try_wait() {
+            self.stop_audio_monitor();
+            return None;
+        }
+
+        let Some(stdout) = capture.child.stdout.as_mut() else {
+            self.stop_audio_monitor();
+            return None;
+        };
+
+        loop {
+            match stdout.read(&mut self.audio_scratch_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.audio_fresh_buf.extend_from_slice(&self.audio_scratch_buf[..n]);
+                    if self.audio_fresh_buf.len() > 8192 {
+                        let drop_n = self.audio_fresh_buf.len() - 8192;
+                        self.audio_fresh_buf.drain(..drop_n);
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    self.stop_audio_monitor();
+                    return None;
+                }
+            }
+        }
+
+        if self.audio_fresh_buf.len() < 24 {
+            self.last_audio_waveform.clear();
+            return Some(0.0);
+        }
+
+        let start = self.audio_fresh_buf.len().saturating_sub(target_bytes);
+        let bytes = &self.audio_fresh_buf[start
+            ..self.audio_fresh_buf.len() - (self.audio_fresh_buf.len() - start) % 2];
+
+        self.last_audio_waveform.clear();
+        let mut sum_sq = 0.0f64;
+        let mut n = 0usize;
+        for chunk in bytes.chunks_exact(2) {
+            let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
+            self.last_audio_waveform.push(sample);
+            sum_sq += (sample as f64) * (sample as f64);
+            n += 1;
+        }
+        if n == 0 {
+            return Some(0.0);
+        }
+
+        let rms = (sum_sq / n as f64).sqrt() as f32;
+        if rms < 0.0008 {
+            self.last_audio_waveform.clear();
+            return Some(0.0);
+        }
+
+        let normalized = ((rms - 0.0008) / 0.018).clamp(0.0, 1.0);
+        Some(normalized * 100.0)
     }
 
     fn read_network_speed(&mut self, preferred_iface: Option<&str>) -> (f64, f64) {
@@ -353,35 +639,64 @@ impl MetricsCollector {
             return cached;
         }
 
-        let mut caps = false;
-        let mut num = false;
-        let mut scroll = false;
-
-        let entries = match fs::read_dir("/sys/class/leds") {
-            Ok(v) => v,
-            Err(_) => return (false, false, false),
-        };
-
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
-            let brightness = fs::read_to_string(entry.path().join("brightness"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(0);
-            let on = brightness > 0;
-
-            if name.contains("::capslock") {
-                caps = on;
-            } else if name.contains("::numlock") {
-                num = on;
-            } else if name.contains("::scrolllock") {
-                scroll = on;
-            }
+        if !self.led_paths_resolved {
+            self.resolve_keyboard_led_paths();
         }
+
+        let caps = self
+            .caps_led_path
+            .as_ref()
+            .map(|p| Self::read_led_brightness_bool(p))
+            .unwrap_or(false);
+        let num = self
+            .num_led_path
+            .as_ref()
+            .map(|p| Self::read_led_brightness_bool(p))
+            .unwrap_or(false);
+        let scroll = self
+            .scroll_led_path
+            .as_ref()
+            .map(|p| Self::read_led_brightness_bool(p))
+            .unwrap_or(false);
 
         let leds = (caps, num, scroll);
         self.last_keyboard_leds = Some((leds, Instant::now()));
         leds
+    }
+
+    fn resolve_keyboard_led_paths(&mut self) {
+        self.led_paths_resolved = true;
+
+        let entries = match fs::read_dir("/sys/class/leds") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let brightness = entry.path().join("brightness");
+            if name.contains("::capslock") {
+                self.caps_led_path = Some(brightness);
+            } else if name.contains("::numlock") {
+                self.num_led_path = Some(brightness);
+            } else if name.contains("::scrolllock") {
+                self.scroll_led_path = Some(brightness);
+            }
+        }
+    }
+
+    fn read_led_brightness_bool(path: &PathBuf) -> bool {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            > 0
+    }
+}
+
+impl Drop for MetricsCollector {
+    fn drop(&mut self) {
+        self.stop_audio_monitor();
     }
 }
 

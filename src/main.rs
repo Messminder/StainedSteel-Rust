@@ -33,6 +33,10 @@ fn main() -> Result<()> {
             .widget_refresh_rate_ms("memory")
             .unwrap_or(refresh_ms as u32),
         volume_ms: config.widget_refresh_rate_ms("volume").unwrap_or(100),
+        audio_ms: config
+            .widget_refresh_rate_ms("volume")
+            .unwrap_or(refresh_ms as u32)
+            .clamp(12, 40),
         network_ms: config.widget_refresh_rate_ms("network").unwrap_or(1000),
         keyboard_ms: config.widget_refresh_rate_ms("keyboard").unwrap_or(50),
     });
@@ -51,9 +55,9 @@ fn main() -> Result<()> {
     );
 
     let network_iface = config.preferred_network_interface();
+    let mut next_tick = Instant::now();
 
     loop {
-        let started = Instant::now();
         if let Err(err) = run_once(
             &config,
             &network_iface,
@@ -68,9 +72,12 @@ fn main() -> Result<()> {
             break;
         }
 
-        let elapsed = started.elapsed();
-        if elapsed < tick {
-            thread::sleep(tick - elapsed);
+        next_tick += tick;
+        let now = Instant::now();
+        if now < next_tick {
+            thread::sleep(next_tick - now);
+        } else if now.duration_since(next_tick) > tick {
+            next_tick = now;
         }
     }
 
