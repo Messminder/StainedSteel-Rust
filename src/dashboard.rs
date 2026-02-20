@@ -426,11 +426,9 @@ impl DashboardRenderer {
             let new_digits = Self::volume_digits(self.vol_step_to);
 
             let leave_frames = (self.vol_anim_len / 2).max(1);
-            let handoff_frames = 1u8;
             let enter_frames = self
                 .vol_anim_len
                 .saturating_sub(leave_frames)
-                .saturating_sub(handoff_frames)
                 .max(1);
 
             for i in 0..3 {
@@ -468,10 +466,8 @@ impl DashboardRenderer {
                         slot_clip_w,
                         text_clip_h,
                     );
-                } else if self.vol_anim_step < leave_frames + handoff_frames {
-                    continue;
                 } else {
-                    let step = (self.vol_anim_step - leave_frames - handoff_frames) as i32 + 1;
+                    let step = (self.vol_anim_step - leave_frames) as i32 + 1;
                     let enter_frames = enter_frames.max(1) as i32;
                     let offset = text_h - (step * text_h) / enter_frames;
                     self.canvas.draw_char_scaled_invert_clipped(
