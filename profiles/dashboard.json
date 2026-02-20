@@ -1,0 +1,46 @@
+{
+  "$schema": "schema/config.schema.json",
+  "config_name": "Dashboard",
+  "refresh_rate_ms": 143,
+  "display": {
+    "width": 128,
+    "height": 40,
+    "background": 0
+  },
+  "widgets": [
+    {
+      "type": "cpu",
+      "enabled": true,
+      "position": { "x": 0, "y": 0, "w": 10, "h": 40, "z": 0 },
+      "mode": "bar",
+      "bar": { "direction": "vertical", "border": false }
+    },
+    {
+      "type": "volume",
+      "enabled": true,
+      "position": { "x": 12, "y": 0, "w": 84, "h": 19, "z": 0 },
+      "mode": "bar",
+      "show_icon": true,
+      "bar": { "direction": "horizontal", "border": true }
+    },
+    {
+      "type": "keyboard",
+      "enabled": true,
+      "position": { "x": 84, "y": 0, "w": 44, "h": 12, "z": 1 }
+    },
+    {
+      "type": "memory",
+      "enabled": true,
+      "position": { "x": 12, "y": 21, "w": 54, "h": 19, "z": 0 },
+      "mode": "graph",
+      "graph": { "history": 54 }
+    },
+    {
+      "type": "network",
+      "enabled": true,
+      "position": { "x": 76, "y": 21, "w": 52, "h": 19, "z": 0 },
+      "mode": "text",
+      "interface": null
+    }
+  ]
+}

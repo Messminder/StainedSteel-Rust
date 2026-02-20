@@ -1,0 +1,7 @@
+# SteelSeries HID devices - udev rules for StainedSteel
+#
+# Allows non-root users to access SteelSeries OLED displays via hidraw.
+# Installed automatically by install.sh
+
+# SteelSeries Vendor ID
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1038", MODE="0666"
