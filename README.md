@@ -21,6 +21,7 @@ Works on an Apex 5 keyboard. Other keyboards untested.
 - Network monitor.
 - Animated elements and boot animation.
 - Per-widget refresh rate.
+- Decorative Sinewave
 - Easy install script, don't be afraid.
 
 ## Run
