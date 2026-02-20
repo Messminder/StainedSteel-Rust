@@ -8,11 +8,21 @@ pub struct DashboardRenderer {
     canvas: Canvas,
     width: usize,
     mem_history: VecDeque<f32>,
+    prev_caps_lock: Option<bool>,
+    caps_anim_step: u8,
+    caps_anim_len: u8,
+    caps_anim_from: bool,
+    caps_anim_to: bool,
     prev_num_lock: Option<bool>,
     num_anim_step: u8,
     num_anim_len: u8,
     num_anim_from: bool,
     num_anim_to: bool,
+    prev_scroll_lock: Option<bool>,
+    scroll_anim_step: u8,
+    scroll_anim_len: u8,
+    scroll_anim_from: bool,
+    scroll_anim_to: bool,
 }
 
 impl DashboardRenderer {
@@ -21,11 +31,21 @@ impl DashboardRenderer {
             canvas: Canvas::new(width, height),
             width,
             mem_history: VecDeque::new(),
+            prev_caps_lock: None,
+            caps_anim_step: 0,
+            caps_anim_len: 6,
+            caps_anim_from: false,
+            caps_anim_to: false,
             prev_num_lock: None,
             num_anim_step: 0,
             num_anim_len: 6,
             num_anim_from: false,
             num_anim_to: false,
+            prev_scroll_lock: None,
+            scroll_anim_step: 0,
+            scroll_anim_len: 6,
+            scroll_anim_from: false,
+            scroll_anim_to: false,
         }
     }
 
@@ -212,7 +232,9 @@ impl DashboardRenderer {
     fn draw_keyboard(&mut self, widget: &Widget, sample: &MetricsSample) {
         let _ = widget;
 
+        self.update_capslock_animation(sample.caps_lock);
         self.update_numlock_animation(sample.num_lock);
+        self.update_scrolllock_animation(sample.scroll_lock);
 
         let icon_w = 9;
         let gap = 1;
@@ -221,7 +243,20 @@ impl DashboardRenderer {
         let y = 1;
 
         // Caps Lock: up arrow
-        self.draw_chevron(start_x, y, icon_w, true, sample.caps_lock);
+        let caps_anim = if self.caps_anim_step < self.caps_anim_len {
+            Some((
+                self.caps_anim_from,
+                self.caps_anim_to,
+                self.caps_anim_step,
+                self.caps_anim_len,
+            ))
+        } else {
+            None
+        };
+        self.draw_chevron(start_x, y, icon_w, true, sample.caps_lock, caps_anim);
+        if caps_anim.is_some() {
+            self.caps_anim_step = self.caps_anim_step.saturating_add(1);
+        }
 
         // Num Lock: padlock
         let num_x = start_x + icon_w + gap;
@@ -229,82 +264,146 @@ impl DashboardRenderer {
 
         // Scroll Lock: down arrow
         let scrl_x = num_x + icon_w + gap;
-        self.draw_chevron(scrl_x, y, icon_w, false, sample.scroll_lock);
+        let scroll_anim = if self.scroll_anim_step < self.scroll_anim_len {
+            Some((
+                self.scroll_anim_from,
+                self.scroll_anim_to,
+                self.scroll_anim_step,
+                self.scroll_anim_len,
+            ))
+        } else {
+            None
+        };
+        self.draw_chevron(scrl_x, y, icon_w, false, sample.scroll_lock, scroll_anim);
+        if scroll_anim.is_some() {
+            self.scroll_anim_step = self.scroll_anim_step.saturating_add(1);
+        }
+    }
+
+    fn chevron_bitmap(up: bool, on: bool) -> [u16; 10] {
+        if up {
+            if on {
+                [
+                    0x010, // ....X....
+                    0x038, // ...XXX...
+                    0x07C, // ..XXXXX..
+                    0x0FE, // .XXXXXXX.
+                    0x1FF, // XXXXXXXXX
+                    0x038, // ...XXX...
+                    0x038, // ...XXX...
+                    0x038, // ...XXX...
+                    0x038, // ...XXX...
+                    0x038, // ...XXX...
+                ]
+            } else {
+                [
+                    0x010, // ....X....
+                    0x028, // ...X.X...
+                    0x044, // ..X...X..
+                    0x082, // .X.....X.
+                    0x1EF, // XXXX.XXXX
+                    0x028, // ...X.X...
+                    0x028, // ...X.X...
+                    0x028, // ...X.X...
+                    0x028, // ...X.X...
+                    0x038, // ...XXX...
+                ]
+            }
+        } else if on {
+            [
+                0x038, // ...XXX...
+                0x038, // ...XXX...
+                0x038, // ...XXX...
+                0x038, // ...XXX...
+                0x038, // ...XXX...
+                0x1FF, // XXXXXXXXX
+                0x0FE, // .XXXXXXX.
+                0x07C, // ..XXXXX..
+                0x038, // ...XXX...
+                0x010, // ....X....
+            ]
+        } else {
+            [
+                0x038, // ...XXX...
+                0x028, // ...X.X...
+                0x028, // ...X.X...
+                0x028, // ...X.X...
+                0x028, // ...X.X...
+                0x1EF, // XXXX.XXXX
+                0x082, // .X.....X.
+                0x044, // ..X...X..
+                0x028, // ...X.X...
+                0x010, // ....X....
+            ]
+        }
     }
 
     /// Arrow using handcrafted 9×10 pixel bitmaps.
     /// OFF = outline only, ON = solid filled.
-    fn draw_chevron(&mut self, x: i32, y: i32, _w: i32, up: bool, on: bool) {
+    fn draw_chevron(
+        &mut self,
+        x: i32,
+        y: i32,
+        _w: i32,
+        up: bool,
+        on: bool,
+        anim: Option<(bool, bool, u8, u8)>,
+    ) {
         // Each row is a u16 bitmask, bit 0 = leftmost pixel, 9 pixels wide.
-        let bitmap: &[u16; 10] = if up {
-            if on {
-                // Solid up arrow
-                &[
-                    0x010, // ....X....
-                    0x038, // ...XXX...
-                    0x07C, // ..XXXXX..
-                    0x0FE, // .XXXXXXX.
-                    0x1FF, // XXXXXXXXX
-                    0x038, // ...XXX...
-                    0x038, // ...XXX...
-                    0x038, // ...XXX...
-                    0x038, // ...XXX...
-                    0x038, // ...XXX...
-                ]
+        let (bitmap, y_shift): ([u16; 10], i32) = if let Some((from_on, to_on, step, len)) = anim {
+            let t = if len == 0 {
+                1.0
             } else {
-                // Outline up arrow
-                &[
-                    0x010, // ....X....
-                    0x028, // ...X.X...
-                    0x044, // ..X...X..
-                    0x082, // .X.....X.
-                    0x1EF, // XXXX.XXXX
-                    0x028, // ...X.X...
-                    0x028, // ...X.X...
-                    0x028, // ...X.X...
-                    0x028, // ...X.X...
-                    0x038, // ...XXX...
-                ]
+                (step as f32 / len as f32).clamp(0.0, 1.0)
+            };
+
+            let from = Self::chevron_bitmap(up, from_on);
+            let to = Self::chevron_bitmap(up, to_on);
+            let mut blended = from;
+
+            // Transition from center outward: center rows switch first.
+            let center_row = 4i32;
+            let radius = ((t * 5.0).round() as i32).clamp(0, 5);
+            for row in 0..10 {
+                if (row as i32 - center_row).abs() <= radius {
+                    blended[row] = to[row];
+                }
             }
+
+            // OFF transition always bounces downward.
+            // ON transition keeps directional glide by arrow orientation.
+            let shift_mag = ((1.0 - t) * 3.0).round() as i32;
+            let shift = if !to_on {
+                shift_mag
+            } else if up {
+                -shift_mag
+            } else {
+                shift_mag
+            };
+
+            (blended, shift)
         } else {
-            if on {
-                // Solid down arrow
-                &[
-                    0x038, // ...XXX...
-                    0x038, // ...XXX...
-                    0x038, // ...XXX...
-                    0x038, // ...XXX...
-                    0x038, // ...XXX...
-                    0x1FF, // XXXXXXXXX
-                    0x0FE, // .XXXXXXX.
-                    0x07C, // ..XXXXX..
-                    0x038, // ...XXX...
-                    0x010, // ....X....
-                ]
-            } else {
-                // Outline down arrow
-                &[
-                    0x038, // ...XXX...
-                    0x028, // ...X.X...
-                    0x028, // ...X.X...
-                    0x028, // ...X.X...
-                    0x028, // ...X.X...
-                    0x1EF, // XXXX.XXXX
-                    0x082, // .X.....X.
-                    0x044, // ..X...X..
-                    0x028, // ...X.X...
-                    0x010, // ....X....
-                ]
-            }
+            (Self::chevron_bitmap(up, on), 0)
         };
 
         for (row, &bits) in bitmap.iter().enumerate() {
             for col in 0..9i32 {
                 if (bits >> col) & 1 == 1 {
-                    self.canvas.set(x + col, y + row as i32, true);
+                    self.canvas.set(x + col, y + y_shift + row as i32, true);
                 }
             }
         }
+    }
+
+    fn update_capslock_animation(&mut self, now: bool) {
+        if let Some(prev) = self.prev_caps_lock {
+            if prev != now {
+                self.caps_anim_from = prev;
+                self.caps_anim_to = now;
+                self.caps_anim_step = 0;
+            }
+        }
+        self.prev_caps_lock = Some(now);
     }
 
     fn update_numlock_animation(&mut self, now: bool) {
@@ -316,6 +415,17 @@ impl DashboardRenderer {
             }
         }
         self.prev_num_lock = Some(now);
+    }
+
+    fn update_scrolllock_animation(&mut self, now: bool) {
+        if let Some(prev) = self.prev_scroll_lock {
+            if prev != now {
+                self.scroll_anim_from = prev;
+                self.scroll_anim_to = now;
+                self.scroll_anim_step = 0;
+            }
+        }
+        self.prev_scroll_lock = Some(now);
     }
 
     /// A padlock icon: rounded shackle on top, rectangular body below.

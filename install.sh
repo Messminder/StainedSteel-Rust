@@ -21,7 +21,7 @@ echo
 # ─── 1. Build ─────────────────────────────────────────────────────────
 echo "▸ Building release binary..."
 cd "$SCRIPT_DIR"
-cargo build --release
+cargo build --release --locked
 echo "  ✓ Build complete"
 echo
 
@@ -30,6 +30,12 @@ echo "▸ Installing binary to $BIN_DIR/$BIN_NAME"
 mkdir -p "$BIN_DIR"
 cp -f "$SCRIPT_DIR/target/release/stained_steel_rust" "$BIN_DIR/$BIN_NAME"
 chmod +x "$BIN_DIR/$BIN_NAME"
+if command -v strip >/dev/null 2>&1; then
+    strip "$BIN_DIR/$BIN_NAME" || true
+    echo "  ✓ Binary stripped"
+else
+    echo "  → strip not found, skipping"
+fi
 echo "  ✓ Binary installed"
 echo
 
