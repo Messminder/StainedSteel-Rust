@@ -437,10 +437,10 @@ impl MetricsCollector {
                 &monitor_name,
                 "--raw",
                 "--format=s16le",
-                "--rate=16000",
+                "--rate=8000",
                 "--channels=1",
-                "--latency-msec=10",
-                "--process-time-msec=10",
+                "--latency-msec=20",
+                "--process-time-msec=20",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -474,9 +474,8 @@ impl MetricsCollector {
     fn read_output_monitor_level(&mut self) -> Option<f32> {
         self.ensure_audio_monitor()?;
 
-        const SAMPLE_COUNT: usize = 192;
+        const SAMPLE_COUNT: usize = 128;
         let target_bytes = SAMPLE_COUNT * 2;
-        self.audio_fresh_buf.clear();
 
         let Some(capture) = self.audio_monitor.as_mut() else {
             self.stop_audio_monitor();
@@ -493,15 +492,12 @@ impl MetricsCollector {
             return None;
         };
 
-        loop {
+        // Limit iterations to avoid CPU spin when lots of data available
+        for _ in 0..4 {
             match stdout.read(&mut self.audio_scratch_buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     self.audio_fresh_buf.extend_from_slice(&self.audio_scratch_buf[..n]);
-                    if self.audio_fresh_buf.len() > 8192 {
-                        let drop_n = self.audio_fresh_buf.len() - 8192;
-                        self.audio_fresh_buf.drain(..drop_n);
-                    }
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => {
@@ -509,6 +505,13 @@ impl MetricsCollector {
                     return None;
                 }
             }
+        }
+
+        // Keep only the tail we need (more efficient than drain)
+        if self.audio_fresh_buf.len() > 4096 {
+            let keep_start = self.audio_fresh_buf.len() - 4096;
+            self.audio_fresh_buf.copy_within(keep_start.., 0);
+            self.audio_fresh_buf.truncate(4096);
         }
 
         if self.audio_fresh_buf.len() < 24 {

@@ -34,6 +34,8 @@ pub struct DashboardRenderer {
     scroll_anim_len: u8,
     scroll_anim_from: bool,
     scroll_anim_to: bool,
+    silence_start: Option<Instant>,
+    idle_sine_phase: f32,
 }
 
 impl DashboardRenderer {
@@ -67,6 +69,8 @@ impl DashboardRenderer {
             scroll_anim_len: 6,
             scroll_anim_from: false,
             scroll_anim_to: false,
+            silence_start: None,
+            idle_sine_phase: 0.0,
         }
     }
 
@@ -134,36 +138,65 @@ impl DashboardRenderer {
         }
 
         let center_y = (draw_top + draw_bottom) / 2;
-        if sample.volume_percent <= 0.0 || sample.audio_waveform.is_empty() {
-            self.canvas.line(clip_left, center_y, clip_right, center_y, true);
-            return;
-        }
-
         let max_amp = ((draw_bottom - draw_top) / 2).max(1) as f32;
         let level = (sample.audio_level / 100.0).clamp(0.0, 1.0);
         let silence_gate = 0.02f32;
+        let is_silent = sample.volume_percent <= 0.0 || sample.audio_waveform.is_empty() || level <= silence_gate;
 
-        if level <= silence_gate {
+        // Track silence duration
+        if is_silent {
+            if self.silence_start.is_none() {
+                self.silence_start = Some(Instant::now());
+            }
+        } else {
+            self.silence_start = None;
+        }
+
+        // Calculate idle sine blend (0.0 = flatline, 1.0 = full sine)
+        let idle_blend = if let Some(start) = self.silence_start {
+            let elapsed = start.elapsed().as_secs_f32();
+            if elapsed < 5.0 {
+                0.0
+            } else {
+                ((elapsed - 5.0) / 2.0).clamp(0.0, 1.0) // Fade in over 2 seconds
+            }
+        } else {
+            0.0
+        };
+
+        // Animate idle sine phase
+        if idle_blend > 0.0 {
+            self.idle_sine_phase = (self.idle_sine_phase + 0.15).rem_euclid(TAU);
+        }
+
+        let width = (clip_right - clip_left + 1) as usize;
+
+        if is_silent && idle_blend <= 0.0 {
+            // Pure flatline
             self.canvas.line(clip_left, center_y, clip_right, center_y, true);
             return;
         }
 
-        // Draw real waveform samples
-        let width = (clip_right - clip_left + 1) as usize;
         let waveform = &sample.audio_waveform;
         let waveform_len = waveform.len();
+        let gain = 5.0f32;
+        let wavelength = 20.0f32;
 
         let mut prev_y: Option<i32> = None;
-        let gain = 5.0f32; // Amplification factor
         for (i, x) in (clip_left..=clip_right).enumerate() {
-            // Map display x to waveform sample index
-            let sample_idx = (i * waveform_len) / width.max(1);
-            let sample_val = waveform.get(sample_idx).copied().unwrap_or(0.0);
-
-            // Scale sample to display amplitude with gain
-            let y = (center_y as f32 - sample_val * gain * max_amp)
-                .round()
-                .clamp(draw_top as f32, draw_bottom as f32) as i32;
+            let y = if is_silent {
+                // Idle sine wave
+                let theta = ((x - clip_left) as f32 / wavelength) * TAU + self.idle_sine_phase;
+                let sine_val = theta.sin() * idle_blend * max_amp * 0.6;
+                (center_y as f32 - sine_val).round().clamp(draw_top as f32, draw_bottom as f32) as i32
+            } else {
+                // Real waveform
+                let sample_idx = (i * waveform_len) / width.max(1);
+                let sample_val = waveform.get(sample_idx).copied().unwrap_or(0.0);
+                (center_y as f32 - sample_val * gain * max_amp)
+                    .round()
+                    .clamp(draw_top as f32, draw_bottom as f32) as i32
+            };
 
             if let Some(py) = prev_y {
                 self.canvas.line(x - 1, py, x, y, true);
