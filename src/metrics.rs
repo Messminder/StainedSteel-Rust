@@ -1,6 +1,27 @@
 use std::fs;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy)]
+pub struct MetricIntervals {
+    pub cpu_ms: u32,
+    pub memory_ms: u32,
+    pub volume_ms: u32,
+    pub network_ms: u32,
+    pub keyboard_ms: u32,
+}
+
+impl Default for MetricIntervals {
+    fn default() -> Self {
+        Self {
+            cpu_ms: 0,
+            memory_ms: 0,
+            volume_ms: 100,
+            network_ms: 1000,
+            keyboard_ms: 50,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MetricsSample {
@@ -29,15 +50,27 @@ struct NetSnapshot {
 }
 
 pub struct MetricsCollector {
+    intervals: MetricIntervals,
+    last_cpu_percent: Option<(f32, Instant)>,
+    last_mem_percent: Option<(f32, Instant)>,
     last_cpu: Option<CpuSnapshot>,
     last_net: Option<NetSnapshot>,
+    last_network_speed: Option<((f64, f64), Instant)>,
+    last_volume: Option<(f32, Instant)>,
+    last_keyboard_leds: Option<((bool, bool, bool), Instant)>,
 }
 
 impl MetricsCollector {
-    pub fn new() -> Self {
+    pub fn with_intervals(intervals: MetricIntervals) -> Self {
         Self {
+            intervals,
+            last_cpu_percent: None,
+            last_mem_percent: None,
             last_cpu: None,
             last_net: None,
+            last_network_speed: None,
+            last_volume: None,
+            last_keyboard_leds: None,
         }
     }
 
@@ -61,6 +94,14 @@ impl MetricsCollector {
     }
 
     fn read_cpu_percent(&mut self) -> f32 {
+        let interval = Duration::from_millis(self.intervals.cpu_ms as u64);
+        if let Some((cached, at)) = self.last_cpu_percent
+            && interval.as_millis() > 0
+            && at.elapsed() < interval
+        {
+            return cached;
+        }
+
         let content = match fs::read_to_string("/proc/stat") {
             Ok(v) => v,
             Err(_) => return 0.0,
@@ -97,10 +138,20 @@ impl MetricsCollector {
         };
 
         self.last_cpu = Some(current);
-        percent.clamp(0.0, 100.0)
+        let value = percent.clamp(0.0, 100.0);
+        self.last_cpu_percent = Some((value, Instant::now()));
+        value
     }
 
-    fn read_mem_percent(&self) -> f32 {
+    fn read_mem_percent(&mut self) -> f32 {
+        let interval = Duration::from_millis(self.intervals.memory_ms as u64);
+        if let Some((cached, at)) = self.last_mem_percent
+            && interval.as_millis() > 0
+            && at.elapsed() < interval
+        {
+            return cached;
+        }
+
         let content = match fs::read_to_string("/proc/meminfo") {
             Ok(v) => v,
             Err(_) => return 0.0,
@@ -121,14 +172,29 @@ impl MetricsCollector {
             return 0.0;
         }
 
-        ((total_kib - avail_kib) / total_kib * 100.0).clamp(0.0, 100.0)
+        let value = ((total_kib - avail_kib) / total_kib * 100.0).clamp(0.0, 100.0);
+        self.last_mem_percent = Some((value, Instant::now()));
+        value
     }
 
-    fn read_volume_percent(&self) -> f32 {
-        self.read_volume_via_pactl()
+    fn read_volume_percent(&mut self) -> f32 {
+        let volume_sample_interval = Duration::from_millis(self.intervals.volume_ms as u64);
+
+        if let Some((cached, at)) = self.last_volume
+            && volume_sample_interval.as_millis() > 0
+            && at.elapsed() < volume_sample_interval
+        {
+            return cached;
+        }
+
+        let volume = self
+            .read_volume_via_pactl()
             .or_else(|| self.read_volume_via_wpctl())
             .or_else(|| self.read_volume_via_amixer())
-            .unwrap_or(0.0)
+            .unwrap_or(0.0);
+
+        self.last_volume = Some((volume, Instant::now()));
+        volume
     }
 
     fn is_sink_muted_pactl(&self) -> bool {
@@ -192,6 +258,15 @@ impl MetricsCollector {
     }
 
     fn read_network_speed(&mut self, preferred_iface: Option<&str>) -> (f64, f64) {
+        let network_sample_interval = Duration::from_millis(self.intervals.network_ms as u64);
+
+        if let Some((cached, at)) = self.last_network_speed
+            && network_sample_interval.as_millis() > 0
+            && at.elapsed() < network_sample_interval
+        {
+            return cached;
+        }
+
         let content = match fs::read_to_string("/proc/net/dev") {
             Ok(v) => v,
             Err(_) => return (0.0, 0.0),
@@ -263,10 +338,21 @@ impl MetricsCollector {
             at: Some(now),
         });
 
-        (down_bps, up_bps)
+        let speeds = (down_bps, up_bps);
+        self.last_network_speed = Some((speeds, Instant::now()));
+        speeds
     }
 
-    fn read_keyboard_leds(&self) -> (bool, bool, bool) {
+    fn read_keyboard_leds(&mut self) -> (bool, bool, bool) {
+        let led_sample_interval = Duration::from_millis(self.intervals.keyboard_ms as u64);
+
+        if let Some((cached, at)) = self.last_keyboard_leds
+            && led_sample_interval.as_millis() > 0
+            && at.elapsed() < led_sample_interval
+        {
+            return cached;
+        }
+
         let mut caps = false;
         let mut num = false;
         let mut scroll = false;
@@ -293,7 +379,9 @@ impl MetricsCollector {
             }
         }
 
-        (caps, num, scroll)
+        let leds = (caps, num, scroll);
+        self.last_keyboard_leds = Some((leds, Instant::now()));
+        leds
     }
 }
 

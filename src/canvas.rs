@@ -142,6 +142,7 @@ impl Canvas {
     }
 
     /// Draw text using the built-in 4×5 pixel font at the given scale, inverting pixels.
+    #[allow(dead_code)]
     pub fn draw_text_scaled_invert(&mut self, x: i32, y: i32, text: &str, scale: i32) {
         let s = scale.max(1);
         let advance = 5 * s;
@@ -161,6 +162,47 @@ impl Canvas {
                 }
             }
             cursor_x += advance;
+        }
+    }
+
+    /// Draw a single character using the built-in 4×5 pixel font at the given scale,
+    /// inverting pixels but clipped to a rectangular region.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_char_scaled_invert_clipped(
+        &mut self,
+        x: i32,
+        y: i32,
+        ch: char,
+        scale: i32,
+        clip_x: i32,
+        clip_y: i32,
+        clip_w: i32,
+        clip_h: i32,
+    ) {
+        if clip_w <= 0 || clip_h <= 0 {
+            return;
+        }
+
+        let s = scale.max(1);
+        let clip_x2 = clip_x + clip_w - 1;
+        let clip_y2 = clip_y + clip_h - 1;
+
+        if let Some(glyph) = tiny_glyph(ch) {
+            for (row, &bits) in glyph.iter().enumerate() {
+                for col in 0..4i32 {
+                    if (bits >> col) & 1 == 1 {
+                        for dy in 0..s {
+                            for dx in 0..s {
+                                let px = x + col * s + dx;
+                                let py = y + row as i32 * s + dy;
+                                if px >= clip_x && px <= clip_x2 && py >= clip_y && py <= clip_y2 {
+                                    self.invert(px, py);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

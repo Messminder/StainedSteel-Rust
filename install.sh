@@ -42,14 +42,10 @@ echo
 # ─── 3. Install config ────────────────────────────────────────────────
 echo "▸ Installing config to $CONFIG_DIR/"
 mkdir -p "$CONFIG_DIR"
-if [ -f "$CONFIG_DIR/dashboard.json" ]; then
-    echo "  → dashboard.json already exists, keeping your version"
-    echo "  → new default saved as dashboard.json.new"
-    cp -f "$SCRIPT_DIR/profiles/dashboard.json" "$CONFIG_DIR/dashboard.json.new"
-else
-    cp -f "$SCRIPT_DIR/profiles/dashboard.json" "$CONFIG_DIR/dashboard.json"
-fi
-echo "  ✓ Config installed"
+for cfg in "$SCRIPT_DIR"/profiles/*.json; do
+    cp -f "$cfg" "$CONFIG_DIR/"
+done
+echo "  ✓ Config files overwritten from profiles/*.json"
 echo
 
 # ─── 4. udev rules (needs sudo) ───────────────────────────────────────

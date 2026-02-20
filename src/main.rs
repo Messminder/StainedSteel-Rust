@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use config::DashboardConfig;
 use dashboard::DashboardRenderer;
 use hidraw::HidSender;
-use metrics::MetricsCollector;
+use metrics::{MetricIntervals, MetricsCollector};
 
 const APEX5_VID: u16 = 0x1038;
 const APEX5_PID: u16 = 0x161C;
@@ -24,10 +24,18 @@ fn main() -> Result<()> {
     let config = DashboardConfig::load(&opts.config_path)
         .with_context(|| format!("failed to load config from {}", opts.config_path.display()))?;
 
-    let refresh_ms = config.refresh_rate_ms.max(33) as u64;
+    let refresh_ms = config.refresh_rate_ms.max(16) as u64;
     let tick = Duration::from_millis(refresh_ms);
 
-    let mut metrics = MetricsCollector::new();
+    let mut metrics = MetricsCollector::with_intervals(MetricIntervals {
+        cpu_ms: config.widget_refresh_rate_ms("cpu").unwrap_or(refresh_ms as u32),
+        memory_ms: config
+            .widget_refresh_rate_ms("memory")
+            .unwrap_or(refresh_ms as u32),
+        volume_ms: config.widget_refresh_rate_ms("volume").unwrap_or(100),
+        network_ms: config.widget_refresh_rate_ms("network").unwrap_or(1000),
+        keyboard_ms: config.widget_refresh_rate_ms("keyboard").unwrap_or(50),
+    });
     let mut renderer = DashboardRenderer::new(config.display.width, config.display.height);
     let mut sender = HidSender::new(APEX5_VID, APEX5_PID, APEX5_INTERFACE.to_string());
 

@@ -29,6 +29,8 @@ pub struct Widget {
     pub kind: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub refresh_rate_ms: Option<u32>,
     pub position: Position,
     #[serde(default)]
     pub interface: Option<String>,
@@ -75,10 +77,18 @@ impl DashboardConfig {
             .find(|w| w.enabled && w.kind == "network")
             .and_then(|w| w.interface.clone())
     }
+
+    pub fn widget_refresh_rate_ms(&self, kind: &str) -> Option<u32> {
+        self.widgets
+            .iter()
+            .filter(|w| w.enabled && w.kind == kind)
+            .filter_map(|w| w.refresh_rate_ms)
+            .min()
+    }
 }
 
 fn default_refresh_rate() -> u32 {
-    143
+    33
 }
 
 fn default_enabled() -> bool {
