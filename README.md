@@ -5,6 +5,11 @@ Simple, purpose-built Rust driver for SteelSeries Apex 5 OLED on Linux inspired 
 This driver has been vibecoded for my own computer from SteelClock's sources because i am a menace. Install at your own risks and perils.
 Works on an Apex 5 keyboard. Other keyboards untested.
 
+## Screenshots
+
+![Screenshot 1](Media/screenshot1.png)
+![Screenshot 2](Media/screenshot2.png)
+
 ## Scope
 
 - Loads a single JSON profile: `profiles/dashboard.json`
