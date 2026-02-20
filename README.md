@@ -21,7 +21,8 @@ Works on an Apex 5 keyboard. Other keyboards untested.
 - Network monitor.
 - Animated elements and boot animation.
 - Per-widget refresh rate.
-- Oscilioscope sampling from speakers.
+- Oscilioscope PCM trueform sampling.
+  - Turns into a beautifully accurate sinewave when silent for > 5 seconds.
 - Easy install script, don't be afraid.
 
 ## Run
