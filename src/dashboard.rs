@@ -95,7 +95,63 @@ impl DashboardRenderer {
             }
         }
 
+        self.draw_sine_wave_gap(config);
+
         self.canvas.to_packed_bytes()
+    }
+
+    fn draw_sine_wave_gap(&mut self, config: &DashboardConfig) {
+        let volume = match config.widgets.iter().find(|w| w.enabled && w.kind == "volume") {
+            Some(w) => w,
+            None => return,
+        };
+        let keyboard = match config.widgets.iter().find(|w| w.enabled && w.kind == "keyboard") {
+            Some(w) => w,
+            None => return,
+        };
+        let network = match config.widgets.iter().find(|w| w.enabled && w.kind == "network") {
+            Some(w) => w,
+            None => return,
+        };
+
+        let keyboard_bottom = keyboard.position.y + keyboard.position.h - 1;
+        let band_top = keyboard_bottom + 1;
+        let band_bottom = network.position.y - 1;
+
+        let volume_right = volume.position.x + volume.position.w - 1;
+        let clip_left = keyboard
+            .position
+            .x
+            .max(network.position.x)
+            .max(volume_right + 1);
+        let clip_right = (keyboard.position.x + keyboard.position.w - 1)
+            .min(network.position.x + network.position.w - 1);
+
+        let draw_top = band_top;
+        let draw_bottom = band_bottom;
+        if draw_top > draw_bottom || clip_left >= clip_right {
+            return;
+        }
+
+        let center_y = (draw_top + draw_bottom) / 2;
+        let amplitude = ((draw_bottom - draw_top) / 2).max(1) as f32;
+        let wavelength = 18.0f32;
+        let phase = self.boot_started.elapsed().as_secs_f32() * 3.2;
+
+        let mut prev_y: Option<i32> = None;
+        for x in clip_left..=clip_right {
+            let theta = ((x - clip_left) as f32 / wavelength) * TAU + phase;
+            let y = (center_y as f32 + amplitude * theta.sin())
+                .round()
+                .clamp(draw_top as f32, draw_bottom as f32) as i32;
+
+            if let Some(py) = prev_y {
+                self.canvas.line(x - 1, py, x, y, true);
+            } else {
+                self.canvas.set(x, y, true);
+            }
+            prev_y = Some(y);
+        }
     }
 
     fn draw_boot_logo(&mut self, progress: f32) {
@@ -567,7 +623,20 @@ impl DashboardRenderer {
 
         // Num Lock: padlock
         let num_x = start_x + icon_w + gap;
-        self.draw_padlock(num_x, y, icon_w, sample.num_lock);
+        let num_anim = if self.num_anim_step < self.num_anim_len {
+            Some((
+                self.num_anim_from,
+                self.num_anim_to,
+                self.num_anim_step,
+                self.num_anim_len,
+            ))
+        } else {
+            None
+        };
+        self.draw_padlock(num_x, y, icon_w, sample.num_lock, num_anim);
+        if num_anim.is_some() {
+            self.num_anim_step = self.num_anim_step.saturating_add(1);
+        }
 
         // Scroll Lock: down arrow
         let scrl_x = num_x + icon_w + gap;
@@ -796,48 +865,107 @@ impl DashboardRenderer {
         self.prev_scroll_lock = Some(now);
     }
 
-    /// A padlock icon: rounded shackle on top, rectangular body below.
-    /// Animated shackle open/close on toggle.
-    fn draw_padlock(&mut self, x: i32, y: i32, w: i32, on: bool) {
-        let mut openness = if on { 0 } else { 3 };
-
-        if self.num_anim_step < self.num_anim_len {
-            let from = if self.num_anim_from { 0.0 } else { 3.0 };
-            let to = if self.num_anim_to { 0.0 } else { 3.0 };
-            let t = self.num_anim_step as f32 / self.num_anim_len as f32;
-            openness = (from + (to - from) * t).round() as i32;
-            self.num_anim_step = self.num_anim_step.saturating_add(1);
-        }
-
-        let body_x = x + 1;
-        let body_y = y + 6;
-        let body_w = w - 2;
-        let body_h = 5;
-
-        // Lock body
+    fn padlock_bitmap(on: bool) -> [u16; 10] {
         if on {
-            self.canvas.rect_fill(body_x, body_y, body_w, body_h, true);
-            // Keyhole: dark dot in center of filled body
-            self.canvas.set(x + w / 2, body_y + 2, false);
+            [
+                0x03C, // ..XXXX...
+                0x044, // ..X...X..
+                0x044, // ..X...X..
+                0x044, // ..X...X..
+                0x1FF, // XXXXXXXXX
+                0x1FF, // XXXXXXXXX
+                0x1EF, // XXXX.XXXX
+                0x1EF, // XXXX.XXXX
+                0x1FF, // XXXXXXXXX
+                0x1FF, // XXXXXXXXX
+            ]
         } else {
-            self.canvas.rect_border(body_x, body_y, body_w, body_h, true);
+            [
+                0x03C, // ..XXXX...
+                0x004, // ..X......
+                0x004, // ..X......
+                0x004, // ..X......
+                0x1FF, // XXXXXXXXX
+                0x101, // X.......X
+                0x101, // X.......X
+                0x111, // X...X...X
+                0x101, // X.......X
+                0x1FF, // XXXXXXXXX
+            ]
         }
+    }
 
-        // Shackle: U-shape above body
-        let shackle_top = y + 2 - openness;
-        let left = x + 2;
-        let right = x + w - 3;
+    /// Padlock animation mirrors chevron animation style:
+    /// center-out bitmap transition plus vertical glide.
+    fn draw_padlock(
+        &mut self,
+        x: i32,
+        y: i32,
+        _w: i32,
+        on: bool,
+        anim: Option<(bool, bool, u8, u8)>,
+    ) {
+        let (bitmap, y_shift): ([u16; 10], i32) = if let Some((from_on, to_on, step, len)) = anim {
+            let t = if len == 0 {
+                1.0
+            } else {
+                (step as f32 / len as f32).clamp(0.0, 1.0)
+            };
 
-        // Left side of shackle
-        self.canvas.line(left, body_y, left, shackle_top + 1, true);
-        // Top arc (flat top + corner pixels for roundness)
-        self.canvas.line(left + 1, shackle_top, right - 1, shackle_top, true);
-        // Right side — only draws when closed/closing
-        if openness <= 1 {
-            self.canvas.line(right, shackle_top + 1, right, body_y, true);
+            let from = Self::padlock_bitmap(from_on);
+            let to = Self::padlock_bitmap(to_on);
+            let mut blended = from;
+
+            let center_row = 4i32;
+            let radius = ((t * 5.0).round() as i32).clamp(0, 5);
+            for row in 0..10 {
+                if (row as i32 - center_row).abs() <= radius {
+                    blended[row] = to[row];
+                }
+            }
+
+            // Ordered right-shackle-leg transition:
+            // OFF: bottom pixel dissolves first, then top pixel.
+            // ON: top pixel reappears first, then bottom pixel.
+            let right_leg_col = 6u16;
+            let bottom_row = 3usize;
+            let top_row = 1usize;
+            let stage = if len <= 1 {
+                2
+            } else {
+                ((step as i32 * 3) / len as i32).clamp(0, 2)
+            };
+
+            if !to_on {
+                if stage >= 1 {
+                    blended[bottom_row] &= !(1u16 << right_leg_col);
+                }
+                if stage >= 2 {
+                    blended[top_row] &= !(1u16 << right_leg_col);
+                }
+            } else {
+                if stage >= 1 {
+                    blended[top_row] |= 1u16 << right_leg_col;
+                }
+                if stage >= 2 {
+                    blended[bottom_row] |= 1u16 << right_leg_col;
+                }
+            }
+
+            let shift_mag = ((1.0 - t) * 3.0).round() as i32;
+            let shift = if to_on { shift_mag } else { -shift_mag };
+
+            (blended, shift)
         } else {
-            // Partial right side when opening
-            self.canvas.line(right, shackle_top + openness, right, shackle_top + openness + 1, true);
+            (Self::padlock_bitmap(on), 0)
+        };
+
+        for (row, &bits) in bitmap.iter().enumerate() {
+            for col in 0..9i32 {
+                if (bits >> col) & 1 == 1 {
+                    self.canvas.set(x + col, y + y_shift + row as i32, true);
+                }
+            }
         }
     }
 
