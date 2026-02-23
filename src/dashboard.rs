@@ -5,6 +5,18 @@ use crate::canvas::Canvas;
 use crate::config::{DashboardConfig, Position, Widget};
 use crate::metrics::MetricsSample;
 
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Keep other transitions available for future use
+enum TransitionType {
+    Noise,
+    Spiral,
+    Radial,
+    Diamond,
+    DoomMelt,
+    Scanlines,
+    Blinds,
+}
+
 pub struct DashboardRenderer {
     canvas: Canvas,
     width: usize,
@@ -36,6 +48,17 @@ pub struct DashboardRenderer {
     scroll_anim_to: bool,
     silence_start: Option<Instant>,
     idle_sine_phase: f32,
+    sep_sine_phase: f32,
+    // Clock / volume overlay state
+    show_volume_overlay: bool,
+    prev_volume_state: Option<(i32, bool)>,  // (volume_rounded, is_muted)
+    volume_overlay_start: Option<Instant>,
+    colon_blink: Instant,
+    // Transition animation (0.0 = clock fully visible, 1.0 = volume fully visible)
+    volume_transition: f32,
+    volume_transition_target: f32,
+    transition_type: TransitionType,
+    melt_seed: u32, // Random seed for DOOM melt pattern
 }
 
 impl DashboardRenderer {
@@ -71,7 +94,29 @@ impl DashboardRenderer {
             scroll_anim_to: false,
             silence_start: None,
             idle_sine_phase: 0.0,
+            sep_sine_phase: 0.0,
+            show_volume_overlay: false,
+            prev_volume_state: None,
+            volume_overlay_start: None,
+            colon_blink: Instant::now(),
+            volume_transition: 0.0,
+            volume_transition_target: 0.0,
+            transition_type: TransitionType::DoomMelt,
+            melt_seed: {
+                let mut tv = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut tv); }
+                tv.tv_nsec as u32
+            },
         }
+    }
+
+    fn pick_random_transition(&mut self) {
+        // DOOM-style melt is so good, it's the only one we need
+        self.transition_type = TransitionType::DoomMelt;
+        // New random seed each transition based on wall clock time
+        let mut tv = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut tv); }
+        self.melt_seed = (tv.tv_sec as u32).wrapping_mul(1000000000).wrapping_add(tv.tv_nsec as u32);
     }
 
     pub fn render(&mut self, config: &DashboardConfig, sample: &MetricsSample) -> Vec<u8> {
@@ -91,7 +136,10 @@ impl DashboardRenderer {
 
             match widget.kind.as_str() {
                 "cpu" => self.draw_cpu(widget, sample),
-                "volume" => self.draw_volume(widget, sample),
+                "volume" => {
+                    self.update_volume_overlay(sample);
+                    self.draw_volume_clock_transition(widget, sample);
+                }
                 "memory" => self.draw_memory(widget, sample),
                 "network" => self.draw_network(widget, sample),
                 "keyboard" => self.draw_keyboard(widget, sample),
@@ -100,6 +148,7 @@ impl DashboardRenderer {
         }
 
         self.draw_sine_wave_gap(config, sample);
+        self.draw_mem_net_separator(config);
 
         self.canvas.to_packed_bytes()
     }
@@ -204,6 +253,53 @@ impl DashboardRenderer {
                 self.canvas.set(x, y, true);
             }
             prev_y = Some(y);
+        }
+    }
+
+    fn draw_mem_net_separator(&mut self, config: &DashboardConfig) {
+        let memory = match config.widgets.iter().find(|w| w.enabled && w.kind == "memory") {
+            Some(w) => w,
+            None => return,
+        };
+        let network = match config.widgets.iter().find(|w| w.enabled && w.kind == "network") {
+            Some(w) => w,
+            None => return,
+        };
+
+        let gap_left = memory.position.x + memory.position.w;
+        let gap_right = network.position.x - 1;
+        if gap_left > gap_right {
+            return;
+        }
+
+        let top = memory.position.y.max(network.position.y) - 2;
+        let bottom = (memory.position.y + memory.position.h - 1)
+            .min(network.position.y + network.position.h - 1);
+        if top > bottom {
+            return;
+        }
+
+        let center_x = (gap_left + gap_right) / 2 + 1;
+        let max_amp = ((gap_right - gap_left) / 2).max(1) as f32;
+        let wavelength = 12.0f32;
+
+        self.sep_sine_phase = (self.sep_sine_phase + 0.10).rem_euclid(TAU);
+
+        let mut prev_x: Option<i32> = None;
+        let mut prev_y_coord: Option<i32> = None;
+        for (i, y) in (top..=bottom).enumerate() {
+            let theta = (i as f32 / wavelength) * TAU + self.sep_sine_phase;
+            let x = (center_x as f32 + theta.sin() * max_amp * 0.7)
+                .round()
+                .clamp(gap_left as f32, gap_right as f32) as i32;
+
+            if let (Some(px), Some(py)) = (prev_x, prev_y_coord) {
+                self.canvas.line(px, py, x, y, true);
+            } else {
+                self.canvas.set(x, y, true);
+            }
+            prev_x = Some(x);
+            prev_y_coord = Some(y);
         }
     }
 
@@ -385,6 +481,324 @@ impl DashboardRenderer {
                     self.canvas.invert(ox + col as i32, oy + row as i32);
                 }
             }
+        }
+    }
+
+    fn update_volume_overlay(&mut self, sample: &MetricsSample) {
+        let vol_now = sample.volume_percent.round() as i32;
+        let muted_now = sample.is_muted;
+        let state_now = (vol_now, muted_now);
+
+        if let Some(prev) = self.prev_volume_state {
+            if state_now != prev {
+                // Volume or mute state changed → show overlay
+                self.show_volume_overlay = true;
+                self.volume_overlay_start = Some(Instant::now());
+                self.volume_transition_target = 1.0; // transition to volume
+                self.pick_random_transition();
+            }
+        }
+        self.prev_volume_state = Some(state_now);
+
+        // Auto-hide volume overlay after 3 seconds
+        if self.show_volume_overlay {
+            if let Some(start) = self.volume_overlay_start {
+                if start.elapsed() > Duration::from_secs(3) {
+                    self.show_volume_overlay = false;
+                    self.volume_overlay_start = None;
+                    self.volume_transition_target = 0.0; // transition back to clock
+                    self.pick_random_transition();
+                }
+            }
+        }
+
+        // Smoothly interpolate transition progress toward target
+        let speed = 0.15; // 15% per frame (smooth ease)
+        if (self.volume_transition - self.volume_transition_target).abs() > 0.01 {
+            self.volume_transition += (self.volume_transition_target - self.volume_transition) * speed;
+        } else {
+            self.volume_transition = self.volume_transition_target;
+        }
+    }
+
+    fn draw_volume_clock_transition(&mut self, widget: &Widget, sample: &MetricsSample) {
+        let p = &widget.position;
+        let progress = self.volume_transition;
+
+        // Optimization: skip blend when fully one or the other
+        if progress <= 0.0 {
+            self.draw_clock(widget);
+            return;
+        }
+        if progress >= 1.0 {
+            self.draw_volume(widget, sample);
+            return;
+        }
+
+        // Draw both widgets to temp canvases
+        let mut clock_canvas = Canvas::new(self.width, self.height);
+        std::mem::swap(&mut self.canvas, &mut clock_canvas);
+        self.draw_clock(widget);
+        std::mem::swap(&mut self.canvas, &mut clock_canvas);
+
+        let mut volume_canvas = Canvas::new(self.width, self.height);
+        std::mem::swap(&mut self.canvas, &mut volume_canvas);
+        self.draw_volume(widget, sample);
+        std::mem::swap(&mut self.canvas, &mut volume_canvas);
+
+        // Apply selected transition effect
+        let frame_seed = (self.colon_blink.elapsed().as_millis() / 16) as u32;
+        let cx = p.w as f32 / 2.0;
+        let cy = p.h as f32 / 2.0;
+        let max_dist = (cx * cx + cy * cy).sqrt();
+
+        for y in p.y..(p.y + p.h) {
+            for x in p.x..(p.x + p.w) {
+                let lx = (x - p.x) as f32;
+                let ly = (y - p.y) as f32;
+
+                let use_volume = match self.transition_type {
+                    TransitionType::Noise => {
+                        // Random noise dissolve
+                        let hash = ((x as u32).wrapping_mul(2654435761))
+                            ^ ((y as u32).wrapping_mul(2246822519))
+                            ^ frame_seed.wrapping_mul(374761393);
+                        let threshold = (hash % 256) as f32 / 255.0;
+                        progress > threshold
+                    }
+                    TransitionType::Spiral => {
+                        // Spiral from center outward
+                        let dx = lx - cx;
+                        let dy = ly - cy;
+                        let dist = (dx * dx + dy * dy).sqrt() / max_dist;
+                        let angle = dy.atan2(dx) / TAU + 0.5; // 0..1
+                        let threshold = (dist * 0.6 + angle * 0.4).fract();
+                        progress > threshold
+                    }
+                    TransitionType::Radial => {
+                        // Circular reveal from center
+                        let dx = lx - cx;
+                        let dy = ly - cy;
+                        let threshold = (dx * dx + dy * dy).sqrt() / max_dist;
+                        progress > threshold
+                    }
+                    TransitionType::Diamond => {
+                        // Diamond shape expanding from center
+                        let dx = (lx - cx).abs() / cx;
+                        let dy = (ly - cy).abs() / cy;
+                        let threshold = (dx + dy) / 2.0;
+                        progress > threshold
+                    }
+                    TransitionType::DoomMelt => {
+                        // DOOM-style screen melt - columns drip down at staggered rates
+                        let col = (x - p.x) as u32;
+                        // Mix column with seed for varied random pattern each transition
+                        let mixed = col.wrapping_add(self.melt_seed);
+                        let col_hash = mixed.wrapping_mul(2654435761)
+                            .wrapping_add(mixed.rotate_left(13))
+                            .wrapping_mul(374761393);
+                        let delay = ((col_hash % 256) as f32 / 255.0) * 0.5; // 0 to 0.5 delay
+                        // How far down has this column melted?
+                        let melt_progress = ((progress - delay) / (1.0 - delay)).clamp(0.0, 1.0);
+                        let melt_y = melt_progress * p.h as f32;
+                        // Pixels above melt_y show new content, below show old
+                        ly < melt_y
+                    }
+                    TransitionType::Scanlines => {
+                        // Alternating horizontal lines reveal at different rates
+                        let row = (y - p.y) as usize;
+                        let offset = if row % 2 == 0 { 0.0 } else { 0.3 };
+                        let threshold = offset + (1.0 - offset) * (x - p.x) as f32 / p.w as f32;
+                        progress > threshold
+                    }
+                    TransitionType::Blinds => {
+                        // Vertical blinds (columns reveal in groups)
+                        let col = (x - p.x) as usize;
+                        let blind_width = 8;
+                        let blind_idx = col / blind_width;
+                        let offset = (blind_idx % 3) as f32 * 0.15;
+                        let threshold = offset + (1.0 - offset) * (y - p.y) as f32 / p.h as f32;
+                        progress > threshold
+                    }
+                };
+
+                let pixel = if use_volume {
+                    volume_canvas.get(x, y)
+                } else {
+                    clock_canvas.get(x, y)
+                };
+                self.canvas.set(x, y, pixel);
+            }
+        }
+    }
+
+    fn draw_clock(&mut self, widget: &Widget) {
+        let p = &widget.position;
+
+        // Get current time
+        let now = {
+            let mut tv = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut tv); } //LOOOOOOL
+            tv.tv_sec
+        };
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&now, &mut tm); } //DRIVER UNUSABLE. RUST WAS A MISTAKE. AI WILL TURN YOUR PC INTO A TIMEBOMB.
+        let hours = tm.tm_hour as u32;
+        let minutes = tm.tm_min as u32;
+        let seconds = tm.tm_sec as u32;
+
+        let blink_elapsed_ms = self.colon_blink.elapsed().as_millis();
+        let colon_on = (blink_elapsed_ms % 1000) < 500;
+
+        // === Seconds progress bar along the bottom (2px tall) ===
+        let bar_y = p.y + p.h - 2;
+        let bar_inner_w = p.w - 2; // 1px margin each side
+        let fill_w = ((seconds as f32 / 59.0) * bar_inner_w as f32).round() as i32;
+        // Bar track (dim dots every 2px)
+        for x in 0..bar_inner_w {
+            if x % 2 == 0 {
+                self.canvas.set(p.x + 1 + x, bar_y + 1, true);
+            }
+        }
+        // Bar fill (solid)
+        for x in 0..fill_w {
+            self.canvas.set(p.x + 1 + x, bar_y, true);
+            self.canvas.set(p.x + 1 + x, bar_y + 1, true);
+        }
+
+        // === Tick marks along the top edge (like a watchface) ===
+        let tick_y = p.y + 1;
+        for i in 0..=12 {
+            let tx = p.x + 1 + (i * (bar_inner_w - 1)) / 12;
+            let tall = i % 3 == 0; // quarter marks are taller
+            self.canvas.set(tx, tick_y, true);
+            if tall {
+                self.canvas.set(tx, tick_y + 1, true);
+            }
+        }
+
+        // === Large HH:MM (scale 2) right-biased, with small :SS tight to the right ===
+        let scale = 2;
+        let glyph_w_lg = 4 * scale; // 8px actual glyph width
+        let digit_advance = glyph_w_lg + 1; // 9px between digit starts (1px gap)
+        let colon_advance = 3 * scale + 1; // 7px for colon/space (narrower)
+        let text_h_lg = 5 * scale; // 10px tall
+
+        let colon_char = if colon_on { ':' } else { ' ' };
+
+        // 12-hour conversion (for AM/PM indicator only)
+        let is_pm = hours >= 12;
+        let display_hour_12 = match hours % 12 {
+            0 => 12,
+            h => h,
+        };
+
+        // Total width: HH + colon + MM
+        let hm_w = 2 * digit_advance + colon_advance + 2 * digit_advance - 1;
+
+        // Small seconds
+        let char_w_sm = 5; // scale 1 advance
+        let text_h_sm = 5;
+        let ss_str = format!("{:02}", seconds);
+        let ss_w = ss_str.len() as i32 * char_w_sm;
+
+        // Tight gap between HH:MM and :SS
+        let gap = 2;
+        let total_w = hm_w + gap + ss_w;
+        // Right-biased: shift toward right edge, leave 2px margin
+        let base_x = p.x + p.w - total_w - 2;
+        let hm_y = p.y + 4;
+        let ss_y = hm_y + text_h_lg - text_h_sm;
+
+        // === 12h numeral (scale 2, left-anchored) with :MM and A/P beside it ===
+        // This section fits in the space before the military clock (base_x)
+        let h12_str = format!("{:<2}", display_hour_12);
+        let h12_x = p.x + 5;
+        let h12_draw_x = h12_x + 1; // hour numeral shifted 1px right
+        self.canvas.draw_text_scaled(h12_draw_x, hm_y, &h12_str[0..1], scale);
+        self.canvas.draw_text_scaled(h12_draw_x + digit_advance, hm_y, &h12_str[1..2], scale);
+
+        // To the right of 12h numeral: :MM on top, A/P on bottom
+        let side_x = h12_x + 2 * digit_advance - 9;
+        let ap_label_w = 4; // tighter fit
+        let ap_label_h = text_h_sm; // 5px
+
+        // :MM tiny with flashing colon (top)
+        let mm_y = hm_y;
+        let colon_tiny = if colon_on { ":" } else { " " };
+        self.canvas.draw_text_scaled(side_x + 1, mm_y, colon_tiny, 1);
+        self.canvas.draw_text_scaled(side_x + 4, mm_y, &format!("{:02}", minutes), 1); // 4px gap (1px tighter)
+
+        // A/P side by side (bottom, anchored to bottom of 12h numeral)
+        let ap_y = hm_y + text_h_lg - ap_label_h;
+        let _a_x = side_x;
+        let _p_x = side_x + ap_label_w + 3;
+
+        // // A (for AM)
+        // if !is_pm {
+        //     self.canvas.rect_fill(a_x, ap_y - 1, ap_label_w + 1, ap_label_h + 2, true);
+        //     self.canvas.draw_text_scaled_invert(a_x, ap_y, "A", 1);
+        // } else {
+        //     self.canvas.draw_text_scaled(a_x, ap_y, "A", 1);
+        // }
+
+        // // P (for PM)
+        // if is_pm {
+        //     self.canvas.rect_fill(p_x, ap_y - 1, ap_label_w + 1, ap_label_h + 2, true);
+        //     self.canvas.draw_text_scaled_invert(p_x, ap_y, "P", 1);
+        // } else {
+        //     self.canvas.draw_text_scaled(p_x, ap_y, "P", 1);
+        // }
+
+        // Suppress unused variable warnings
+        let _ = (ap_label_w, ap_label_h, ap_y, is_pm);
+
+        // Draw HH:MM character by character with tighter spacing (24h military format)
+        let h_str = format!("{:02}", hours);
+        let m_str = format!("{:02}", minutes);
+        let mut cx = base_x;
+        for ch in h_str.chars() {
+            self.canvas.draw_text_scaled(cx, hm_y, &ch.to_string(), scale);
+            cx += digit_advance;
+        }
+        self.canvas.draw_text_scaled(cx, hm_y, &colon_char.to_string(), scale);
+        cx += colon_advance;
+        for ch in m_str.chars() {
+            self.canvas.draw_text_scaled(cx, hm_y, &ch.to_string(), scale);
+            cx += digit_advance;
+        }
+
+        // Small colon before seconds (decorative)
+        let colon_x = cx;
+        self.canvas.set(colon_x, ss_y + 1, true);
+        self.canvas.set(colon_x, ss_y + 3, true);
+
+        self.canvas.draw_text_scaled(cx + gap, ss_y, &ss_str, 1);
+
+        // === Scanning dot — traces along the widget perimeter once per minute ===
+        let perimeter = 2 * (p.w - 1) + 2 * (p.h - 1);
+        let dot_pos = ((seconds as f32 / 60.0) * perimeter as f32).round() as i32;
+        let (dx, dy) = self.perimeter_point(p.x, p.y, p.w, p.h, dot_pos);
+        // Draw a 2px inverted "cursor"
+        self.canvas.invert(dx, dy);
+        let (dx2, dy2) = self.perimeter_point(p.x, p.y, p.w, p.h, (dot_pos + 1) % perimeter);
+        self.canvas.invert(dx2, dy2);
+    }
+
+    /// Map a linear offset along a rectangle's perimeter to (x, y).
+    fn perimeter_point(&self, rx: i32, ry: i32, rw: i32, rh: i32, offset: i32) -> (i32, i32) {
+        let top = rw - 1;
+        let right = rh - 1;
+        let bottom = rw - 1;
+        let _left = rh - 1;
+        if offset < top {
+            (rx + offset, ry)
+        } else if offset < top + right {
+            (rx + rw - 1, ry + offset - top)
+        } else if offset < top + right + bottom {
+            (rx + rw - 1 - (offset - top - right), ry + rh - 1)
+        } else {
+            (rx, ry + rh - 1 - (offset - top - right - bottom))
         }
     }
 

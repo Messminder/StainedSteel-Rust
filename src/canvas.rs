@@ -29,6 +29,18 @@ impl Canvas {
         self.pixels[uy * self.width + ux] = u8::from(on);
     }
 
+    pub fn get(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let ux = x as usize;
+        let uy = y as usize;
+        if ux >= self.width || uy >= self.height {
+            return false;
+        }
+        self.pixels[uy * self.width + ux] != 0
+    }
+
     pub fn invert(&mut self, x: i32, y: i32) {
         if x < 0 || y < 0 {
             return;

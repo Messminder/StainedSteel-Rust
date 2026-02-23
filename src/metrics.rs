@@ -33,6 +33,7 @@ pub struct MetricsSample {
     pub cpu_percent: f32,
     pub mem_percent: f32,
     pub volume_percent: f32,
+    pub is_muted: bool,
     pub audio_level: f32,
     pub audio_waveform: Vec<f32>,
     pub net_up_bps: f64,
@@ -68,7 +69,7 @@ pub struct MetricsCollector {
     last_cpu: Option<CpuSnapshot>,
     last_net: Option<NetSnapshot>,
     last_network_speed: Option<((f64, f64), Instant)>,
-    last_volume: Option<(f32, Instant)>,
+    last_volume: Option<((f32, bool), Instant)>,  // (volume, is_muted)
     last_audio_level: Option<(f32, Instant)>,
     audio_level_ema: f32,
     audio_monitor: Option<AudioMonitorCapture>,
@@ -115,7 +116,8 @@ impl MetricsCollector {
     pub fn sample(&mut self, preferred_iface: Option<&str>) -> MetricsSample {
         let cpu_percent = self.read_cpu_percent();
         let mem_percent = self.read_mem_percent();
-        let volume_percent = self.read_volume_percent();
+        let (raw_volume, is_muted) = self.read_volume_and_mute();
+        let volume_percent = if is_muted { 0.0 } else { raw_volume };
         let audio_level = self.read_audio_output_level();
         let (net_down_bps, net_up_bps) = self.read_network_speed(preferred_iface);
         let (caps_lock, num_lock, scroll_lock) = self.read_keyboard_leds();
@@ -124,6 +126,7 @@ impl MetricsCollector {
             cpu_percent,
             mem_percent,
             volume_percent,
+            is_muted,
             audio_level,
             audio_waveform: self.last_audio_waveform.clone(),
             net_up_bps,
@@ -243,7 +246,7 @@ impl MetricsCollector {
         value
     }
 
-    fn read_volume_percent(&mut self) -> f32 {
+    fn read_volume_and_mute(&mut self) -> (f32, bool) {
         let volume_sample_interval = Duration::from_millis(self.intervals.volume_ms as u64);
 
         if let Some((cached, at)) = self.last_volume
@@ -253,29 +256,17 @@ impl MetricsCollector {
             return cached;
         }
 
-        let volume = self
-            .read_volume_via_wpctl()
-            .or_else(|| self.read_volume_via_pactl())
-            .or_else(|| self.read_volume_via_amixer())
-            .unwrap_or(0.0);
+        let result = self
+            .read_volume_mute_wpctl()
+            .or_else(|| self.read_volume_mute_pactl())
+            .or_else(|| self.read_volume_mute_amixer())
+            .unwrap_or((0.0, false));
 
-        self.last_volume = Some((volume, Instant::now()));
-        volume
+        self.last_volume = Some((result, Instant::now()));
+        result
     }
 
-    fn read_volume_via_pactl(&self) -> Option<f32> {
-        let output = Command::new("pactl")
-            .args(["get-sink-volume", "@DEFAULT_SINK@"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-
-        parse_percent_from_text(&String::from_utf8_lossy(&output.stdout))
-    }
-
-    fn read_volume_via_wpctl(&self) -> Option<f32> {
+    fn read_volume_mute_wpctl(&self) -> Option<(f32, bool)> {
         let output = Command::new("wpctl")
             .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
             .output()
@@ -283,30 +274,46 @@ impl MetricsCollector {
         if !output.status.success() {
             return None;
         }
-
         let text = String::from_utf8_lossy(&output.stdout);
-        if text.contains("[MUTED]") {
-            return Some(0.0);
-        }
+        let muted = text.contains("[MUTED]");
         for token in text.split_whitespace() {
             if let Ok(value) = token.parse::<f32>() {
-                return Some((value * 100.0).clamp(0.0, 100.0));
+                return Some(((value * 100.0).clamp(0.0, 100.0), muted));
             }
         }
         None
     }
 
-    fn read_volume_via_amixer(&self) -> Option<f32> {
+    fn read_volume_mute_pactl(&self) -> Option<(f32, bool)> {
+        let vol_output = Command::new("pactl")
+            .args(["get-sink-volume", "@DEFAULT_SINK@"])
+            .output()
+            .ok()?;
+        if !vol_output.status.success() {
+            return None;
+        }
+        let volume = parse_percent_from_text(&String::from_utf8_lossy(&vol_output.stdout))?;
+
+        let mute_output = Command::new("pactl")
+            .args(["get-sink-mute", "@DEFAULT_SINK@"])
+            .output()
+            .ok();
+        let muted = mute_output
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("yes"))
+            .unwrap_or(false);
+
+        Some((volume, muted))
+    }
+
+    fn read_volume_mute_amixer(&self) -> Option<(f32, bool)> {
         let output = Command::new("amixer").arg("get").arg("Master").output().ok()?;
         if !output.status.success() {
             return None;
         }
-
         let text = String::from_utf8_lossy(&output.stdout);
-        if text.contains("[off]") {
-            return Some(0.0);
-        }
-        parse_percent_from_text(&text)
+        let muted = text.contains("[off]");
+        let volume = parse_percent_from_text(&text)?;
+        Some((volume, muted))
     }
 
     fn default_sink_name_pactl(&self) -> Option<String> {

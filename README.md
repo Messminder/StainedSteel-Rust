@@ -1,6 +1,6 @@
 # StainedSteel Rust (KISS Edition)
 
-Simple, purpose-built Rust driver for SteelSeries Apex 5 OLED on Linux inspired by Steelclock's Go drivers. It's stained steel because it's written in Rust.
+Simple yet elegant, purpose-built Rust driver for SteelSeries Apex 5 OLED on Linux inspired by Steelclock's Go drivers. It's stained steel because it's written in Rust.
 
 This driver has been vibecoded for my own computer from SteelClock's sources because i am a menace. Install at your own risks and perils.
 Works on an Apex 5 keyboard. Other keyboards untested.
@@ -14,7 +14,9 @@ Works on an Apex 5 keyboard. Other keyboards untested.
 ## Dashboard Features
 
 - Key indicators for ScrlLock, NumLock and CruseCTRL.
-- Volume slider for scroll wheel with Earthbound numeral display.
+- A nice clock made for easily confused people. Like me.
+  - Volume slider shows up when you scroll whell. 
+  - It has an Earthbound-inspired numeral display.
 - Mute wheel button works.
 - RAM monitor.
 - CPU monitor.
@@ -23,6 +25,7 @@ Works on an Apex 5 keyboard. Other keyboards untested.
 - Per-widget refresh rate.
 - Oscilioscope PCM trueform sampling.
   - Turns into a beautifully accurate sinewave when silent for > 5 seconds.
+- neat sinewave seperator, just to hypnotize you more.
 - Easy install script, don't be afraid.
 
 ## Run
