@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use crate::canvas::Canvas;
 use crate::config::{DashboardConfig, Position, Widget};
 use crate::metrics::MetricsSample;
+use crate::weather::{WeatherCache, WeatherCondition};
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // Keep other transitions available for future use
@@ -59,6 +60,9 @@ pub struct DashboardRenderer {
     volume_transition_target: f32,
     transition_type: TransitionType,
     melt_seed: u32, // Random seed for DOOM melt pattern
+    // Weather
+    weather: WeatherCache,
+    weather_anim_phase: f32,
 }
 
 impl DashboardRenderer {
@@ -107,6 +111,8 @@ impl DashboardRenderer {
                 unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut tv); }
                 tv.tv_nsec as u32
             },
+            weather: WeatherCache::new(),
+            weather_anim_phase: 0.0,
         }
     }
 
@@ -686,13 +692,6 @@ impl DashboardRenderer {
 
         let colon_char = if colon_on { ':' } else { ' ' };
 
-        // 12-hour conversion (for AM/PM indicator only)
-        let is_pm = hours >= 12;
-        let display_hour_12 = match hours % 12 {
-            0 => 12,
-            h => h,
-        };
-
         // Total width: HH + colon + MM
         let hm_w = 2 * digit_advance + colon_advance + 2 * digit_advance - 1;
 
@@ -710,48 +709,19 @@ impl DashboardRenderer {
         let hm_y = p.y + 4;
         let ss_y = hm_y + text_h_lg - text_h_sm;
 
-        // === 12h numeral (scale 2, left-anchored) with :MM and A/P beside it ===
-        // This section fits in the space before the military clock (base_x)
-        let h12_str = format!("{:<2}", display_hour_12);
-        let h12_x = p.x + 5;
-        let h12_draw_x = h12_x + 1; // hour numeral shifted 1px right
-        self.canvas.draw_text_scaled(h12_draw_x, hm_y, &h12_str[0..1], scale);
-        self.canvas.draw_text_scaled(h12_draw_x + digit_advance, hm_y, &h12_str[1..2], scale);
-
-        // To the right of 12h numeral: :MM on top, A/P on bottom
-        let side_x = h12_x + 2 * digit_advance - 9;
-        let ap_label_w = 4; // tighter fit
-        let ap_label_h = text_h_sm; // 5px
-
-        // :MM tiny with flashing colon (top)
-        let mm_y = hm_y;
-        let colon_tiny = if colon_on { ":" } else { " " };
-        self.canvas.draw_text_scaled(side_x + 1, mm_y, colon_tiny, 1);
-        self.canvas.draw_text_scaled(side_x + 4, mm_y, &format!("{:02}", minutes), 1); // 4px gap (1px tighter)
-
-        // A/P side by side (bottom, anchored to bottom of 12h numeral)
-        let ap_y = hm_y + text_h_lg - ap_label_h;
-        let _a_x = side_x;
-        let _p_x = side_x + ap_label_w + 3;
-
-        // // A (for AM)
-        // if !is_pm {
-        //     self.canvas.rect_fill(a_x, ap_y - 1, ap_label_w + 1, ap_label_h + 2, true);
-        //     self.canvas.draw_text_scaled_invert(a_x, ap_y, "A", 1);
-        // } else {
-        //     self.canvas.draw_text_scaled(a_x, ap_y, "A", 1);
-        // }
-
-        // // P (for PM)
-        // if is_pm {
-        //     self.canvas.rect_fill(p_x, ap_y - 1, ap_label_w + 1, ap_label_h + 2, true);
-        //     self.canvas.draw_text_scaled_invert(p_x, ap_y, "P", 1);
-        // } else {
-        //     self.canvas.draw_text_scaled(p_x, ap_y, "P", 1);
-        // }
-
-        // Suppress unused variable warnings
-        let _ = (ap_label_w, ap_label_h, ap_y, is_pm);
+        // === Weather icon (left side, replaces 12h clock) ===
+        // Update weather data periodically
+        self.weather.update();
+        self.weather_anim_phase += 0.1; // Advance animation
+        if self.weather_anim_phase > TAU * 100.0 {
+            self.weather_anim_phase = 0.0; // Prevent overflow
+        }
+        
+        let icon_x = p.x + 5;
+        let icon_y = p.y + 4;
+        let icon_size = 14; // 14x14 pixel area for weather icon
+        
+        self.draw_weather_icon(icon_x, icon_y, icon_size);
 
         // Draw HH:MM character by character with tighter spacing (24h military format)
         let h_str = format!("{:02}", hours);
@@ -799,6 +769,381 @@ impl DashboardRenderer {
             (rx + rw - 1 - (offset - top - right), ry + rh - 1)
         } else {
             (rx, ry + rh - 1 - (offset - top - right - bottom))
+        }
+    }
+
+    fn draw_weather_icon(&mut self, x: i32, y: i32, size: i32) {
+        let phase = self.weather_anim_phase;
+        let condition = self.weather.condition;
+
+        match condition {
+            WeatherCondition::Sunny => self.draw_sun_icon(x, y, size, phase),
+            WeatherCondition::PartlyCloudy => self.draw_partly_cloudy_icon(x, y, size, phase),
+            WeatherCondition::Cloudy => self.draw_cloud_icon(x, y, size, phase),
+            WeatherCondition::Fog => self.draw_fog_icon(x, y, size, phase),
+            WeatherCondition::Drizzle => self.draw_drizzle_icon(x, y, size, phase),
+            WeatherCondition::Rain => self.draw_rain_icon(x, y, size, phase),
+            WeatherCondition::Thunderstorm => self.draw_thunderstorm_icon(x, y, size, phase),
+            WeatherCondition::Snow => self.draw_snow_icon(x, y, size, phase),
+            WeatherCondition::Unknown => self.draw_unknown_icon(x, y, size, phase),
+        }
+    }
+
+    fn draw_sun_icon(&mut self, x: i32, y: i32, _size: i32, phase: f32) {
+        // Hand-crafted pixel art sun with pulsing glow
+        let cx = x + 7;
+        let cy = y + 6;
+        
+        // Sun core - clean circle
+        #[rustfmt::skip]
+        const SUN_CORE: [[u8; 7]; 7] = [
+            [0,0,1,1,1,0,0],
+            [0,1,1,1,1,1,0],
+            [1,1,1,1,1,1,1],
+            [1,1,1,1,1,1,1],
+            [1,1,1,1,1,1,1],
+            [0,1,1,1,1,1,0],
+            [0,0,1,1,1,0,0],
+        ];
+        
+        for (row, cols) in SUN_CORE.iter().enumerate() {
+            for (col, &px) in cols.iter().enumerate() {
+                if px == 1 {
+                    self.canvas.set(cx - 3 + col as i32, cy - 3 + row as i32, true);
+                }
+            }
+        }
+        
+        // Animated rays - 8 rays with alternating lengths
+        let ray_phase = phase * 2.0;
+        let pulse = (ray_phase.sin() * 0.5 + 0.5) as i32; // 0 or 1
+        
+        // Cardinal rays (longer)
+        let long_len = 3 + pulse;
+        // Top ray
+        for i in 0..long_len { self.canvas.set(cx, cy - 4 - i, true); }
+        // Bottom ray
+        for i in 0..long_len { self.canvas.set(cx, cy + 4 + i, true); }
+        // Left ray
+        for i in 0..long_len { self.canvas.set(cx - 4 - i, cy, true); }
+        // Right ray
+        for i in 0..long_len { self.canvas.set(cx + 4 + i, cy, true); }
+        
+        // Diagonal rays (shorter, offset phase)
+        let short_len = 2 + (1 - pulse);
+        let diag_offset = 3;
+        // Top-left
+        for i in 0..short_len { self.canvas.set(cx - diag_offset - i, cy - diag_offset - i, true); }
+        // Top-right
+        for i in 0..short_len { self.canvas.set(cx + diag_offset + i, cy - diag_offset - i, true); }
+        // Bottom-left
+        for i in 0..short_len { self.canvas.set(cx - diag_offset - i, cy + diag_offset + i, true); }
+        // Bottom-right
+        for i in 0..short_len { self.canvas.set(cx + diag_offset + i, cy + diag_offset + i, true); }
+    }
+
+    fn draw_cloud_icon(&mut self, x: i32, y: i32, _size: i32, phase: f32) {
+        // Hand-crafted fluffy cloud with drift + bob animation
+        let bob = ((phase * 1.5).sin() * 2.0) as i32;
+        let drift = ((phase * 0.8).cos() * 1.5) as i32;
+        let cx = x + 7 + drift;
+        let cy = y + 6 + bob;
+        
+        // Fluffy cloud sprite - carefully designed
+        #[rustfmt::skip]
+        const CLOUD: [[u8; 14]; 9] = [
+            [0,0,0,0,0,1,1,1,0,0,0,0,0,0],
+            [0,0,0,0,1,1,1,1,1,0,0,0,0,0],
+            [0,0,1,1,1,1,1,1,1,1,1,0,0,0],
+            [0,1,1,1,1,1,1,1,1,1,1,1,0,0],
+            [1,1,1,1,1,1,1,1,1,1,1,1,1,0],
+            [1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+            [0,1,1,1,1,1,1,1,1,1,1,1,1,0],
+            [0,0,1,1,1,1,1,1,1,1,1,1,0,0],
+            [0,0,0,0,1,1,1,1,1,1,0,0,0,0],
+        ];
+        
+        for (row, cols) in CLOUD.iter().enumerate() {
+            for (col, &px) in cols.iter().enumerate() {
+                if px == 1 {
+                    self.canvas.set(cx - 7 + col as i32, cy - 4 + row as i32, true);
+                }
+            }
+        }
+    }
+
+    fn draw_rain_icon(&mut self, x: i32, y: i32, _size: i32, phase: f32) {
+        // Cloud with stylized raindrops
+        let cx = x + 7;
+        let cy = y + 3;
+        
+        // Compact rain cloud
+        #[rustfmt::skip]
+        const RAIN_CLOUD: [[u8; 12]; 5] = [
+            [0,0,0,1,1,1,1,1,0,0,0,0],
+            [0,0,1,1,1,1,1,1,1,0,0,0],
+            [0,1,1,1,1,1,1,1,1,1,0,0],
+            [1,1,1,1,1,1,1,1,1,1,1,0],
+            [0,1,1,1,1,1,1,1,1,1,0,0],
+        ];
+        
+        for (row, cols) in RAIN_CLOUD.iter().enumerate() {
+            for (col, &px) in cols.iter().enumerate() {
+                if px == 1 {
+                    self.canvas.set(cx - 6 + col as i32, cy - 2 + row as i32, true);
+                }
+            }
+        }
+        
+        // Animated raindrops - elongated teardrop shapes
+        let drops = [
+            (cx - 4, 0.0),
+            (cx - 1, 0.3),
+            (cx + 2, 0.6),
+            (cx + 5, 0.15),
+        ];
+        
+        for (drop_x, offset) in drops {
+            let drop_phase = (phase * 2.5 + offset * TAU) % TAU;
+            let progress = drop_phase / TAU;
+            let drop_y = cy + 4 + (progress * 8.0) as i32;
+            
+            if drop_y < y + 13 {
+                // Teardrop shape: | at top, : below
+                self.canvas.set(drop_x, drop_y, true);
+                self.canvas.set(drop_x, drop_y + 1, true);
+                if drop_y < y + 11 {
+                    self.canvas.set(drop_x, drop_y + 2, true);
+                }
+            }
+        }
+    }
+
+    fn draw_snow_icon(&mut self, x: i32, y: i32, _size: i32, phase: f32) {
+        // Elegant snowflakes falling gently
+        // Each snowflake is a tiny * pattern
+        
+        let flakes = [
+            (x + 2, 0.0, 0),
+            (x + 6, 0.4, 1),
+            (x + 10, 0.8, 0),
+            (x + 4, 0.2, 1),
+            (x + 8, 0.6, 0),
+            (x + 12, 0.1, 1),
+        ];
+        
+        for (base_x, offset, style) in flakes {
+            let flake_phase = (phase * 1.5 + offset * TAU) % TAU;
+            let progress = flake_phase / TAU;
+            
+            // Gentle horizontal drift
+            let drift = ((flake_phase * 2.0).sin() * 2.0) as i32;
+            let flake_x = base_x + drift;
+            let flake_y = y + 1 + (progress * 12.0) as i32;
+            
+            if flake_y < y + 13 && flake_x >= x && flake_x < x + 14 {
+                // Draw snowflake based on style
+                self.canvas.set(flake_x, flake_y, true);
+                
+                if style == 0 {
+                    // Simple cross +
+                    self.canvas.set(flake_x - 1, flake_y, true);
+                    self.canvas.set(flake_x + 1, flake_y, true);
+                    self.canvas.set(flake_x, flake_y - 1, true);
+                    self.canvas.set(flake_x, flake_y + 1, true);
+                } else {
+                    // Diagonal cross ×
+                    self.canvas.set(flake_x - 1, flake_y - 1, true);
+                    self.canvas.set(flake_x + 1, flake_y - 1, true);
+                    self.canvas.set(flake_x - 1, flake_y + 1, true);
+                    self.canvas.set(flake_x + 1, flake_y + 1, true);
+                }
+            }
+        }
+    }
+
+    fn draw_unknown_icon(&mut self, x: i32, y: i32, _size: i32, phase: f32) {
+        // Stylized loading/question indicator
+        let cx = x + 7;
+        let cy = y + 6;
+        
+        // Spinning dots around center
+        let dot_count = 6;
+        let radius = 5.0;
+        let brightness_phase = phase * 2.0;
+        
+        for i in 0..dot_count {
+            let angle = (i as f32 / dot_count as f32) * TAU + phase * 2.0;
+            let dx = (angle.cos() * radius) as i32;
+            let dy = (angle.sin() * radius) as i32;
+            
+            // Each dot fades based on position in rotation
+            let dot_brightness = ((i as f32 / dot_count as f32) * TAU + brightness_phase * 2.0).sin();
+            if dot_brightness > -0.3 {
+                self.canvas.set(cx + dx, cy + dy, true);
+            }
+        }
+        
+        // Center dot
+        self.canvas.set(cx, cy, true);
+    }
+
+    fn draw_partly_cloudy_icon(&mut self, x: i32, y: i32, _size: i32, phase: f32) {
+        // Sun peeking behind a cloud
+        let cx = x + 7;
+        let cy = y + 6;
+        
+        // Small sun in upper-left with pulsing rays
+        let sun_x = cx - 3;
+        let sun_y = cy - 2;
+        let pulse = ((phase * 2.0).sin() * 0.5 + 0.5) as i32;
+        
+        // Sun core (small)
+        self.canvas.set(sun_x, sun_y, true);
+        self.canvas.set(sun_x - 1, sun_y, true);
+        self.canvas.set(sun_x + 1, sun_y, true);
+        self.canvas.set(sun_x, sun_y - 1, true);
+        self.canvas.set(sun_x, sun_y + 1, true);
+        
+        // Rays (pulsing)
+        if pulse == 1 {
+            self.canvas.set(sun_x - 2, sun_y - 1, true);
+            self.canvas.set(sun_x + 2, sun_y - 1, true);
+            self.canvas.set(sun_x - 2, sun_y + 1, true);
+        }
+        
+        // Cloud in front (lower-right), with bob
+        let bob = ((phase * 1.2).sin() * 1.5) as i32;
+        let cloud_y = cy + 2 + bob;
+        
+        #[rustfmt::skip]
+        const SMALL_CLOUD: [[u8; 10]; 5] = [
+            [0,0,0,1,1,1,0,0,0,0],
+            [0,0,1,1,1,1,1,0,0,0],
+            [0,1,1,1,1,1,1,1,0,0],
+            [1,1,1,1,1,1,1,1,1,0],
+            [0,1,1,1,1,1,1,1,0,0],
+        ];
+        
+        for (row, cols) in SMALL_CLOUD.iter().enumerate() {
+            for (col, &px) in cols.iter().enumerate() {
+                if px == 1 {
+                    self.canvas.set(cx - 3 + col as i32, cloud_y - 2 + row as i32, true);
+                }
+            }
+        }
+    }
+
+    fn draw_fog_icon(&mut self, x: i32, y: i32, _size: i32, phase: f32) {
+        // Horizontal fog lines that drift
+        let cx = x + 7;
+        
+        // Multiple horizontal lines with varying drift
+        let lines = [
+            (y + 3, 0.0, 10),
+            (y + 5, 0.3, 12),
+            (y + 7, 0.6, 10),
+            (y + 9, 0.9, 8),
+            (y + 11, 0.2, 10),
+        ];
+        
+        for (line_y, offset, width) in lines {
+            let drift = ((phase * 0.8 + offset * TAU).sin() * 2.0) as i32;
+            let start_x = cx - width / 2 + drift;
+            
+            // Dashed fog line with gaps
+            for i in 0..width {
+                if i % 3 != 2 { // Create small gaps
+                    self.canvas.set(start_x + i, line_y, true);
+                }
+            }
+        }
+    }
+
+    fn draw_drizzle_icon(&mut self, x: i32, y: i32, _size: i32, phase: f32) {
+        // Light cloud with small diagonal rain
+        let cx = x + 7;
+        let cy = y + 3;
+        
+        // Small cloud
+        #[rustfmt::skip]
+        const DRIZZLE_CLOUD: [[u8; 10]; 4] = [
+            [0,0,0,1,1,1,0,0,0,0],
+            [0,0,1,1,1,1,1,0,0,0],
+            [0,1,1,1,1,1,1,1,0,0],
+            [1,1,1,1,1,1,1,1,1,0],
+        ];
+        
+        for (row, cols) in DRIZZLE_CLOUD.iter().enumerate() {
+            for (col, &px) in cols.iter().enumerate() {
+                if px == 1 {
+                    self.canvas.set(cx - 5 + col as i32, cy - 1 + row as i32, true);
+                }
+            }
+        }
+        
+        // Light diagonal drizzle drops (smaller, more spaced)
+        let drops = [
+            (cx - 3, 0.0),
+            (cx + 1, 0.5),
+            (cx + 4, 0.25),
+        ];
+        
+        for (drop_x, offset) in drops {
+            let drop_phase = (phase * 2.0 + offset * TAU) % TAU;
+            let progress = drop_phase / TAU;
+            let drop_y = cy + 4 + (progress * 7.0) as i32;
+            
+            if drop_y < y + 12 {
+                // Single pixel drops (light drizzle)
+                self.canvas.set(drop_x, drop_y, true);
+            }
+        }
+    }
+
+    fn draw_thunderstorm_icon(&mut self, x: i32, y: i32, _size: i32, phase: f32) {
+        // Dark cloud with lightning bolt
+        let cx = x + 7;
+        let cy = y + 3;
+        
+        // Compact storm cloud
+        #[rustfmt::skip]
+        const STORM_CLOUD: [[u8; 12]; 5] = [
+            [0,0,0,1,1,1,1,1,0,0,0,0],
+            [0,0,1,1,1,1,1,1,1,0,0,0],
+            [0,1,1,1,1,1,1,1,1,1,0,0],
+            [1,1,1,1,1,1,1,1,1,1,1,0],
+            [0,1,1,1,1,1,1,1,1,1,0,0],
+        ];
+        
+        for (row, cols) in STORM_CLOUD.iter().enumerate() {
+            for (col, &px) in cols.iter().enumerate() {
+                if px == 1 {
+                    self.canvas.set(cx - 6 + col as i32, cy - 2 + row as i32, true);
+                }
+            }
+        }
+        
+        // Flashing lightning bolt
+        let flash = ((phase * 4.0).sin() > 0.3) as i32;
+        if flash == 1 {
+            // Lightning bolt shape: zigzag
+            //   ##
+            //  ##
+            //   #
+            //  ##
+            //   #
+            let bolt_x = cx - 1;
+            let bolt_y = cy + 4;
+            
+            self.canvas.set(bolt_x + 1, bolt_y, true);
+            self.canvas.set(bolt_x + 2, bolt_y, true);
+            self.canvas.set(bolt_x, bolt_y + 1, true);
+            self.canvas.set(bolt_x + 1, bolt_y + 1, true);
+            self.canvas.set(bolt_x + 1, bolt_y + 2, true);
+            self.canvas.set(bolt_x, bolt_y + 3, true);
+            self.canvas.set(bolt_x + 1, bolt_y + 3, true);
+            self.canvas.set(bolt_x + 1, bolt_y + 4, true);
         }
     }
 

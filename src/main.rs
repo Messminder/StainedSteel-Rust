@@ -3,6 +3,7 @@ mod config;
 mod dashboard;
 mod hidraw;
 mod metrics;
+mod weather;
 
 use std::env;
 use std::thread;
