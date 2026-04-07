@@ -1,9 +1,11 @@
-# StainedSteel Rust (KISS Edition)
+# StainedSteel Rust (KISS* Edition)
 
 Simple yet elegant, purpose-built Rust driver for SteelSeries Apex 5 OLED on Linux inspired by Steelclock's Go drivers. It's stained steel because it's written in Rust.
 
 This driver has been vibecoded for my own computer from SteelClock's sources because i am a menace. Install at your own risks and perils.
 Works on an Apex 5 keyboard. Other keyboards untested.
+
+*KISS in this repo means KEEP IT SUPER SLICK!
 
 ## Screenshots
 

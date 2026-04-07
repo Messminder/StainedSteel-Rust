@@ -1,4 +1,6 @@
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -14,12 +16,21 @@ pub enum WeatherCondition {
     Unknown,
 }
 
+/// Thread-safe weather data shared between fetcher and renderer
+struct WeatherData {
+    condition: WeatherCondition,
+    temperature: f32,
+    location: Option<(f64, f64)>,
+    last_fetch_attempt: Option<Instant>,
+    fetch_in_progress: bool,
+}
+
 pub struct WeatherCache {
     pub condition: WeatherCondition,
     pub temperature: f32,
-    last_fetch: Option<Instant>,
+    shared: Arc<Mutex<WeatherData>>,
     fetch_interval: Duration,
-    location: Option<(f64, f64)>, // (lat, lon)
+    retry_interval: Duration, // Wait before retrying after failure
 }
 
 impl WeatherCache {
@@ -27,33 +38,88 @@ impl WeatherCache {
         Self {
             condition: WeatherCondition::Unknown,
             temperature: 0.0,
-            last_fetch: None,
-            fetch_interval: Duration::from_secs(3600), // 1 hour
-            location: None,
+            shared: Arc::new(Mutex::new(WeatherData {
+                condition: WeatherCondition::Unknown,
+                temperature: 0.0,
+                location: None,
+                last_fetch_attempt: None,
+                fetch_in_progress: false,
+            })),
+            fetch_interval: Duration::from_secs(3600), // 1 hour between successful fetches
+            retry_interval: Duration::from_secs(300),  // 5 minutes between retries on failure
         }
     }
 
+    /// Non-blocking update - spawns background thread if needed, reads cached value
     pub fn update(&mut self) {
-        // Only fetch if enough time has passed
-        if let Some(last) = self.last_fetch {
-            if last.elapsed() < self.fetch_interval {
-                return;
-            }
+        // First, read any updated data from background thread
+        if let Ok(data) = self.shared.lock() {
+            self.condition = data.condition;
+            self.temperature = data.temperature;
         }
 
-        // Get location if we don't have it
-        if self.location.is_none() {
-            self.location = fetch_location();
+        // Check if we should start a new fetch
+        let should_fetch = {
+            if let Ok(data) = self.shared.lock() {
+                if data.fetch_in_progress {
+                    false // Already fetching
+                } else if let Some(last) = data.last_fetch_attempt {
+                    // Use retry_interval if we haven't successfully fetched yet
+                    let interval = if data.location.is_some() && data.condition != WeatherCondition::Unknown {
+                        self.fetch_interval
+                    } else {
+                        self.retry_interval
+                    };
+                    last.elapsed() >= interval
+                } else {
+                    true // Never fetched
+                }
+            } else {
+                false
+            }
+        };
+
+        if should_fetch {
+            self.spawn_fetch();
+        }
+    }
+
+    fn spawn_fetch(&self) {
+        // Mark fetch in progress
+        if let Ok(mut data) = self.shared.lock() {
+            if data.fetch_in_progress {
+                return; // Another thread already started
+            }
+            data.fetch_in_progress = true;
+            data.last_fetch_attempt = Some(Instant::now());
         }
 
-        // Fetch weather if we have location
-        if let Some((lat, lon)) = self.location {
-            if let Some((condition, temp)) = fetch_weather(lat, lon) {
-                self.condition = condition;
-                self.temperature = temp;
-                self.last_fetch = Some(Instant::now());
+        let shared = Arc::clone(&self.shared);
+        thread::spawn(move || {
+            // Get location if needed
+            let location = {
+                let data = shared.lock().ok();
+                data.and_then(|d| d.location)
+            };
+
+            let location = location.or_else(fetch_location);
+
+            // Fetch weather if we have location
+            let result = location.and_then(|(lat, lon)| {
+                fetch_weather(lat, lon).map(|(cond, temp)| (lat, lon, cond, temp))
+            });
+
+            // Update shared state
+            if let Ok(mut data) = shared.lock() {
+                data.fetch_in_progress = false;
+                if let Some((lat, lon, condition, temperature)) = result {
+                    data.location = Some((lat, lon));
+                    data.condition = condition;
+                    data.temperature = temperature;
+                }
+                // last_fetch_attempt already set, so retry logic will use appropriate interval
             }
-        }
+        });
     }
 }
 

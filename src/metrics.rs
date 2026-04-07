@@ -409,7 +409,7 @@ impl MetricsCollector {
             || self.cached_monitor_source.is_none()
             || self
                 .last_audio_route_probe
-                .is_none_or(|at| at.elapsed() >= Duration::from_millis(1500));
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
 
         if !should_probe {
             return;
